@@ -5,8 +5,8 @@
 
 namespace peripherals {
 
-// Read-only sensor access for the V1 peripheral bus. The caller owns and
-// initializes the bus; this module never calls TwoWire::begin/end.
+// Sensor access for the V1 peripheral bus. The caller owns and initializes
+// the bus; this module never calls TwoWire::begin/end.
 struct SensorSnapshot {
   bool batterySampleReady = false;
   uint16_t batteryAdcMillivolts = 0;  // Voltage at GPIO4, from calibrated ADC API.
@@ -14,6 +14,10 @@ struct SensorSnapshot {
 
   bool rtcReady = false;
   bool rtcTimeValid = false;  // False for oscillator-stop/invalid/out-of-range data.
+  uint16_t rtcYear = 0;
+  uint8_t rtcMonth = 0;
+  uint8_t rtcDay = 0;
+  uint8_t rtcWeekday = 0;
   uint8_t rtcHour = 0;
   uint8_t rtcMinute = 0;
   uint8_t rtcSecond = 0;
@@ -34,6 +38,8 @@ class Sensors {
  public:
   // Call after the board layer has initialized the shared peripheral TwoWire.
   bool begin(TwoWire& peripheralBus, uint32_t nowMs);
+  // Explicitly set UTC calendar time. Invalid fields are rejected before bus I/O.
+  bool setRtcDateTime(int year, int month, int day, int hour, int minute, int second);
   // Nonblocking scheduler entry. Sampling is internally rate-limited.
   void update(uint32_t nowMs);
   const SensorSnapshot& snapshot() const { return state_; }
@@ -42,6 +48,7 @@ class Sensors {
   TwoWire* bus_ = nullptr;
   uint8_t activeImuAddress_ = 0x6b;
   bool imuDetected_ = false;
+  bool rtcSetFailed_ = false;
   bool batteryAdcReady_ = false;
   SensorSnapshot state_;
   uint32_t lastBatteryMs_ = 0;

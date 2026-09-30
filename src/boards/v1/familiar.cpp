@@ -145,10 +145,27 @@ void sendDiagnostic() {
   JsonArray lastTouchPacket = touchObject["last_touch_packet"].to<JsonArray>();
   for (size_t i = 0; i < sizeof(touchDiag.lastResponse); ++i) lastPacket.add(touchDiag.lastResponse[i]);
   for (size_t i = 0; i < sizeof(touchDiag.lastTouchResponse); ++i) lastTouchPacket.add(touchDiag.lastTouchResponse[i]);
+  diagnostic["battery_gpio4_adc_mv"] = sensor.batterySampleReady ? sensor.batteryAdcMillivolts : 0;
+  diagnostic["battery_divider_estimate_v"] = sensor.batterySampleReady ? sensor.batteryVolts : 0.0f;
   diagnostic["battery_v"] = sensor.batterySampleReady ? sensor.batteryVolts : 0.0f;
   diagnostic["rtc_ready"] = sensor.rtcReady;
   diagnostic["rtc_time_valid"] = sensor.rtcTimeValid;
+  diagnostic["rtc_year"] = sensor.rtcYear;
+  diagnostic["rtc_month"] = sensor.rtcMonth;
+  diagnostic["rtc_day"] = sensor.rtcDay;
+  diagnostic["rtc_weekday"] = sensor.rtcWeekday;
+  diagnostic["rtc_hour"] = sensor.rtcHour;
+  diagnostic["rtc_minute"] = sensor.rtcMinute;
+  diagnostic["rtc_second"] = sensor.rtcSecond;
+  diagnostic["rtc_errors"] = sensor.rtcErrors;
   diagnostic["imu_ready"] = sensor.imuReady;
+  diagnostic["imu_config_ready"] = sensor.imuConfigReady;
+  diagnostic["imu_acceleration_ready"] = sensor.accelerationReady;
+  diagnostic["imu_acceleration_x_g"] = sensor.accelerationXG;
+  diagnostic["imu_acceleration_y_g"] = sensor.accelerationYG;
+  diagnostic["imu_acceleration_z_g"] = sensor.accelerationZG;
+  diagnostic["imu_errors"] = sensor.imuErrors;
+  diagnostic["imu_recoveries"] = sensor.imuRecoveries;
   diagnostic["audio"] = playback.ready() ? "ready" : "unavailable";
   const audio::Diagnostics audioDiag = playback.diagnostics();
   JsonObject audioStats = diagnostic["audio_stats"].to<JsonObject>();
@@ -186,8 +203,8 @@ void setStatusFields(uint32_t now) {
   state.sdStatus = assets.sdReady() ? "SD ready" : String("SD unavailable:") + storage::errorName(assets.lastError());
   state.touchStatus = "AXS15231B";
   state.batteryStatus = sensor.batterySampleReady
-      ? String("BAT ") + String(sensor.batteryVolts, 2) + "V"
-      : "BAT --";
+      ? String("ADC~") + String(sensor.batteryVolts, 2) + "V"
+      : "ADC --";
   if (sensor.rtcTimeValid) {
     char clock[16];
     snprintf(clock, sizeof(clock), "RTC %02u:%02u:%02u", sensor.rtcHour, sensor.rtcMinute, sensor.rtcSecond);
@@ -276,6 +293,27 @@ void processLine(const char* line) {
   }
   if (!strcmp(command, "touchdiag")) {
     sendDiagnostic();
+    return;
+  }
+  if (!strcmp(command, "rtcset")) {
+    const char* const fields[] = {"year", "month", "day", "hour", "minute", "second"};
+    int values[6] = {};
+    bool fieldsValid = true;
+    for (size_t i = 0; i < 6; ++i) {
+      const JsonVariantConst value = request[fields[i]];
+      if (!value.is<int>()) {
+        fieldsValid = false;
+        break;
+      }
+      values[i] = value.as<int>();
+    }
+    const bool set = fieldsValid && sensors.setRtcDateTime(
+        values[0], values[1], values[2], values[3], values[4], values[5]);
+    JsonDocument result;
+    result["cmd"] = "rtcset";
+    result["ok"] = set;
+    result["detail"] = !fieldsValid ? "invalid_fields" : set ? "set" : "invalid_time_or_rtc_failure";
+    sendJson(result);
     return;
   }
   if (!strcmp(command, "audiotest")) {

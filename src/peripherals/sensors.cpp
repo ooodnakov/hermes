@@ -1,10 +1,16 @@
 #include "sensors.h"
 
+#include <cstring>
+
 namespace peripherals {
 namespace {
 constexpr int kBatteryAdcPin = 4;
 constexpr float kBatteryDividerRatio = 3.0f;
 constexpr uint8_t kRtcAddress = 0x51;
+constexpr uint8_t kRtcControl1 = 0x00;
+constexpr uint8_t kRtcSeconds = 0x04;
+constexpr uint8_t kRtcStopBit = 1u << 5;
+constexpr uint8_t kRtc12HourBit = 1u << 1;
 constexpr uint8_t kQmiAddressPrimary = 0x6B;
 constexpr uint8_t kQmiAddressAlternate = 0x6A;
 constexpr uint8_t kQmiWhoAmI = 0x05;
@@ -26,6 +32,29 @@ bool validBcd(uint8_t value, uint8_t max) {
 
 uint8_t fromBcd(uint8_t value) {
   return static_cast<uint8_t>((value >> 4) * 10 + (value & 0x0f));
+}
+
+uint8_t toBcd(uint8_t value) {
+  return static_cast<uint8_t>(((value / 10) << 4) | (value % 10));
+}
+
+bool leapYear(int year) {
+  return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+uint8_t daysInMonth(int year, int month) {
+  constexpr uint8_t days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month < 1 || month > 12) return 0;
+  if (month == 2 && leapYear(year)) return 29;
+  return days[month - 1];
+}
+
+// PCF85063A weekday encoding is 0..6. Use Sunday=0 (Gregorian convention).
+uint8_t weekdayForDate(int year, int month, int day) {
+  static constexpr int offsets[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (month < 3) --year;
+  return static_cast<uint8_t>((year + year / 4 - year / 100 + year / 400 +
+                               offsets[month - 1] + day) % 7);
 }
 
 void incrementSaturated(uint16_t& value) {
@@ -67,11 +96,14 @@ bool Sensors::readRegister(uint8_t address, uint8_t reg, uint8_t& value) {
   if (bus_ == nullptr) return false;
   bus_->beginTransmission(address);
   bus_->write(reg);
-  if (bus_->endTransmission(false) != 0 || bus_->requestFrom(static_cast<int>(address), 1, true) != 1) {
+  if (bus_->endTransmission(false) != 0 || bus_->requestFrom(static_cast<int>(address), 1, true) != 1 ||
+      bus_->available() < 1) {
     while (bus_->available()) bus_->read();
     return false;
   }
-  value = static_cast<uint8_t>(bus_->read());
+  const int received = bus_->read();
+  if (received < 0) return false;
+  value = static_cast<uint8_t>(received);
   return true;
 }
 
@@ -80,21 +112,110 @@ bool Sensors::readRegisters(uint8_t address, uint8_t reg, uint8_t* data, size_t 
   bus_->beginTransmission(address);
   bus_->write(reg);
   if (bus_->endTransmission(false) != 0 ||
-      bus_->requestFrom(static_cast<int>(address), static_cast<int>(length), true) !=
-          static_cast<int>(length)) {
+      bus_->requestFrom(static_cast<int>(address), static_cast<int>(length), true) != length ||
+      bus_->available() < static_cast<int>(length)) {
     while (bus_->available()) bus_->read();
     return false;
   }
-  for (size_t i = 0; i < length; ++i) data[i] = static_cast<uint8_t>(bus_->read());
+  for (size_t i = 0; i < length; ++i) {
+    const int received = bus_->read();
+    if (received < 0) return false;
+    data[i] = static_cast<uint8_t>(received);
+  }
   return true;
 }
 
 bool Sensors::writeRegister(uint8_t address, uint8_t reg, uint8_t value) {
   if (bus_ == nullptr) return false;
   bus_->beginTransmission(address);
-  bus_->write(reg);
-  bus_->write(value);
-  return bus_->endTransmission(true) == 0;
+  const bool registerWritten = bus_->write(reg) == 1;
+  const bool valueWritten = bus_->write(value) == 1;
+  const bool transactionOk = bus_->endTransmission(true) == 0;
+  return registerWritten && valueWritten && transactionOk;
+}
+
+bool Sensors::setRtcDateTime(int year, int month, int day, int hour, int minute, int second) {
+  // Reject the complete request before touching I2C.
+  if (bus_ == nullptr || year < 2000 || year > 2099 || month < 1 || month > 12 ||
+      day < 1 || day > daysInMonth(year, month) || hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 || second < 0 || second > 59) {
+    return false;
+  }
+
+  // A failed attempt must not let the periodic sampler bless potentially
+  // partial calendar contents. Only a fully verified set clears this latch.
+  rtcSetFailed_ = true;
+  state_.rtcTimeValid = false;
+  uint8_t control = 0;
+  if (!readRegister(kRtcAddress, kRtcControl1, control)) {
+    state_.rtcReady = false;
+    state_.rtcTimeValid = false;
+    incrementSaturated(state_.rtcErrors);
+    return false;
+  }
+  // Preserve unrelated Control_1 bits, select 24-hour mode, and stop the
+  // prescaler so the calendar registers can be changed as one coherent value.
+  // Per the PCF85063A data sheet (https://www.nxp.com/docs/en/data-sheet/PCF85063A.pdf),
+  // STOP freezes the calendar and OS is cleared by writing seconds with bit 7 zero.
+  // STOP does not make an interrupted I2C transaction atomic, so a power loss
+  // during this write can leave an uncertain calendar; the next sample validates it.
+  const uint8_t stoppedControl = static_cast<uint8_t>((control | kRtcStopBit) & ~kRtc12HourBit);
+  if (!writeRegister(kRtcAddress, kRtcControl1, stoppedControl)) {
+    // Transaction outcome may be uncertain; restore the original control byte.
+    (void)writeRegister(kRtcAddress, kRtcControl1, control);
+    state_.rtcTimeValid = false;
+    incrementSaturated(state_.rtcErrors);
+    return false;
+  }
+
+  const uint8_t weekday = weekdayForDate(year, month, day);
+  const uint8_t requested[] = {
+      toBcd(static_cast<uint8_t>(second)), toBcd(static_cast<uint8_t>(minute)),
+      toBcd(static_cast<uint8_t>(hour)), toBcd(static_cast<uint8_t>(day)), weekday,
+      toBcd(static_cast<uint8_t>(month)), toBcd(static_cast<uint8_t>(year - 2000)),
+  };
+  bus_->beginTransmission(kRtcAddress);
+  const bool addressWritten = bus_->write(kRtcSeconds) == 1;
+  const bool dataWritten = bus_->write(requested, sizeof(requested)) == sizeof(requested);
+  const bool transactionOk = bus_->endTransmission(true) == 0;
+  const bool written = addressWritten && dataWritten && transactionOk;
+  uint8_t readback[sizeof(requested)] = {};
+  const bool verified = written && readRegisters(kRtcAddress, kRtcSeconds, readback, sizeof(readback)) &&
+                        !(readback[0] & 0x80) &&
+                        memcmp(readback, requested, sizeof(requested)) == 0;
+  // Restore the original STOP/mode state after failure. A fully verified set
+  // deliberately restarts in 24-hour mode.
+  const uint8_t runningControl = static_cast<uint8_t>(stoppedControl & ~kRtcStopBit);
+  const uint8_t finalControl = verified ? runningControl : control;
+  bool restarted = writeRegister(kRtcAddress, kRtcControl1, finalControl);
+  if (!restarted) restarted = writeRegister(kRtcAddress, kRtcControl1, finalControl);
+  uint8_t controlReadback = 0;
+  const bool restartVerified = restarted && readRegister(kRtcAddress, kRtcControl1, controlReadback) &&
+      (verified ? controlReadback == runningControl
+                : controlReadback == control);
+  if (!verified || !restartVerified) {
+    if (verified) {
+      // Calendar data checked out, but clock restart did not. Restore the
+      // caller's original STOP/mode state as a final best-effort cleanup.
+      bool restored = writeRegister(kRtcAddress, kRtcControl1, control);
+      if (!restored) (void)writeRegister(kRtcAddress, kRtcControl1, control);
+    }
+    state_.rtcTimeValid = false;
+    incrementSaturated(state_.rtcErrors);
+    return false;
+  }
+
+  state_.rtcReady = true;
+  state_.rtcTimeValid = true;
+  state_.rtcYear = static_cast<uint16_t>(year);
+  state_.rtcMonth = static_cast<uint8_t>(month);
+  state_.rtcDay = static_cast<uint8_t>(day);
+  state_.rtcWeekday = weekday;
+  state_.rtcHour = static_cast<uint8_t>(hour);
+  state_.rtcMinute = static_cast<uint8_t>(minute);
+  state_.rtcSecond = static_cast<uint8_t>(second);
+  rtcSetFailed_ = false;
+  return true;
 }
 
 bool Sensors::configureImu() {
@@ -171,25 +292,49 @@ void Sensors::sampleBattery() {
 }
 
 void Sensors::sampleRtc() {
-  uint8_t time[3] = {};
-  if (!readRegisters(kRtcAddress, 0x04, time, sizeof(time))) {
+  uint8_t control = 0;
+  uint8_t time[7] = {};
+  if (!readRegister(kRtcAddress, kRtcControl1, control) ||
+      !readRegisters(kRtcAddress, kRtcSeconds, time, sizeof(time))) {
     state_.rtcReady = false;
     state_.rtcTimeValid = false;
     incrementSaturated(state_.rtcErrors);
     return;
   }
   state_.rtcReady = true;
-  // PCF85063 seconds bit 7 is VL (voltage-low), so never expose that time as
-  // valid. The chip stores seconds, minutes, hours at 0x04..0x06.
+  // The seconds OS flag means oscillator integrity is not guaranteed until
+  // cleared by an explicit valid time set.
   const uint8_t seconds = time[0] & 0x7f;
   const uint8_t minutes = time[1] & 0x7f;
-  const uint8_t hours = time[2] & 0x3f;
-  state_.rtcTimeValid = !(time[0] & 0x80) && validBcd(seconds, 59) &&
-                        validBcd(minutes, 59) && validBcd(hours, 23);
+  const bool twelveHourMode = (control & kRtc12HourBit) != 0;
+  const uint8_t hours = time[2] & (twelveHourMode ? 0x1f : 0x3f);
+  const uint8_t day = time[3] & 0x3f;
+  const uint8_t weekday = time[4] & 0x07;
+  const uint8_t month = time[5] & 0x1f;
+  const uint8_t year = time[6];
+  const uint8_t hourValue = validBcd(hours, twelveHourMode ? 12 : 23)
+      ? fromBcd(hours) : 0;
+  const bool hourValid = twelveHourMode ? hourValue >= 1 : validBcd(hours, 23);
+  const uint8_t monthValue = validBcd(month, 12) ? fromBcd(month) : 0;
+  const uint8_t dayValue = validBcd(day, 31) ? fromBcd(day) : 0;
+  const uint8_t yearValue = validBcd(year, 99) ? fromBcd(year) : 0;
+  bool valid = !(control & kRtcStopBit) && !(time[0] & 0x80) && validBcd(seconds, 59) &&
+      validBcd(minutes, 59) && hourValid && dayValue >= 1 && weekday <= 6 &&
+      monthValue >= 1 && validBcd(year, 99);
+  valid = valid && dayValue <= daysInMonth(2000 + yearValue, monthValue);
+  state_.rtcTimeValid = valid && !rtcSetFailed_;
   if (state_.rtcTimeValid) {
     state_.rtcSecond = fromBcd(seconds);
     state_.rtcMinute = fromBcd(minutes);
-    state_.rtcHour = fromBcd(hours);
+    state_.rtcHour = hourValue;
+    if (twelveHourMode) {
+      state_.rtcHour %= 12;
+      if (time[2] & 0x20) state_.rtcHour += 12;
+    }
+    state_.rtcYear = static_cast<uint16_t>(2000 + yearValue);
+    state_.rtcMonth = monthValue;
+    state_.rtcDay = dayValue;
+    state_.rtcWeekday = weekday;
   }
 }
 
@@ -212,6 +357,7 @@ void Sensors::sampleImu(uint32_t nowMs) {
   state_.accelerationYG = static_cast<float>(ay) / 8192.0f;
   state_.accelerationZG = static_cast<float>(az) / 8192.0f;
   state_.accelerationReady = true;
+  state_.imuReady = true;
 
   (void)nowMs;
 }
