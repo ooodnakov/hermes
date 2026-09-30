@@ -4,6 +4,7 @@
 #include "../../display/axs15231b_display.h"
 #include "../../input/axs15231b_touch.h"
 #include "../../peripherals/sensors.h"
+#include "../../protocol/serial_line_framer.h"
 #include "../../protocol/ui_state.h"
 #include "../../storage/v1_assets.h"
 #include "../../ui/familiar_ui.h"
@@ -18,7 +19,6 @@
 #include <cstring>
 
 namespace {
-constexpr size_t kLineCapacity = 4096;
 constexpr uint32_t kTouchIntervalMs = 20;
 constexpr uint32_t kRenderIntervalMs = 220;
 constexpr uint32_t kTelemetryIntervalMs = 60000;
@@ -53,9 +53,7 @@ bool displayReady = false;
 bool canvasReady = false;
 bool systemHoldReady = false;
 bool touchActive = false;
-bool inputLineOverflow = false;
-char inputLine[kLineCapacity];
-size_t inputLength = 0;
+protocol::SerialLineFramer<> serialLineFramer;
 int16_t touchStartX = 0, touchStartY = 0, touchLastX = 0, touchLastY = 0;
 uint32_t touchStartedAt = 0;
 uint32_t lastStatusUpdateAt = 0;
@@ -326,22 +324,19 @@ void processLine(const char* line) {
 void pollSerial() {
   while (Serial.available() > 0) {
     const char c = static_cast<char>(Serial.read());
-    if (c == '\n') {
-      if (!inputLineOverflow) {
-        inputLine[inputLength] = '\0';
-        if (inputLength && inputLine[inputLength - 1] == '\r') inputLine[inputLength - 1] = '\0';
-        if (inputLength) processLine(inputLine);
-      } else {
-        JsonDocument error;
-        error["type"] = "error";
-        error["error"] = "line_too_long";
-        sendJson(error);
-      }
-      inputLength = 0;
-      inputLineOverflow = false;
-    } else if (!inputLineOverflow) {
-      if (inputLength + 1 < sizeof(inputLine)) inputLine[inputLength++] = c;
-      else { inputLength = 0; inputLineOverflow = true; }
+    const protocol::SerialLineFramer<>::Result result = serialLineFramer.push(c);
+    if (result == protocol::SerialLineFramer<>::Result::LineReady) {
+      processLine(serialLineFramer.line());
+    } else if (result == protocol::SerialLineFramer<>::Result::LineTooLong) {
+      JsonDocument error;
+      error["type"] = "error";
+      error["error"] = "line_too_long";
+      sendJson(error);
+    } else if (result == protocol::SerialLineFramer<>::Result::InvalidLine) {
+      JsonDocument error;
+      error["type"] = "error";
+      error["error"] = "invalid_line";
+      sendJson(error);
     }
   }
 }
