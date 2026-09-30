@@ -21,6 +21,9 @@ struct SensorSnapshot {
   uint8_t rtcHour = 0;
   uint8_t rtcMinute = 0;
   uint8_t rtcSecond = 0;
+  // millis() at the last complete control/calendar read or verified clock set,
+  // even if its data was invalid. Failed bus reads leave it unchanged.
+  uint32_t rtcSampledAtMs = 0;
 
   bool imuReady = false;
   bool imuConfigReady = false;

@@ -24,7 +24,21 @@ void testBootReadsWithoutSettingRtc() {
   assert(state.rtcTimeValid);
   assert(state.rtcYear == 2024 && state.rtcMonth == 2 && state.rtcDay == 29);
   assert(state.rtcWeekday == 4 && state.rtcHour == 12 && state.rtcMinute == 34 && state.rtcSecond == 56);
+  assert(state.rtcSampledAtMs > 0);
   assert(bus.rtcWriteTransactions == 0);
+}
+
+void testRtcSampleTimestampTracksCompleteReadsOnly() {
+  TwoWire bus;
+  setValidRtc(bus);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  const uint32_t firstSample = sensors.snapshot().rtcSampledAtMs;
+  bus.failTransaction = bus.transactionCount + 1;
+  sensors.update(1000);
+  assert(sensors.snapshot().rtcSampledAtMs == firstSample);
+  sensors.update(2000);
+  assert(sensors.snapshot().rtcSampledAtMs > firstSample);
 }
 
 void testInvalidBcdAndImpossibleCalendar() {
@@ -90,8 +104,10 @@ void testExplicitSetAndStrictValidation() {
   assert(bus.transactionCount == beforeTransactions);
   assert(sensors.snapshot().rtcTimeValid);  // A rejected request leaves prior trusted data intact.
 
+  const uint32_t beforeVerifiedSet = sensors.snapshot().rtcSampledAtMs;
   bus.set(kRtc, 0x04, 0xd7);  // Prior OS flag is cleared by the explicit seconds write.
   assert(sensors.setRtcDateTime(2024, 2, 29, 23, 58, 57));
+  assert(sensors.snapshot().rtcSampledAtMs > beforeVerifiedSet);
   assert((bus.get(kRtc, 0x00) & 0x20) == 0);
   assert((bus.get(kRtc, 0x00) & 0x02) == 0);
   assert((bus.get(kRtc, 0x00) & 0x81) == 0x81);
@@ -181,6 +197,7 @@ void testImuSamplingRestoresReadyAfterTransientReadError() {
 
 int main() {
   testBootReadsWithoutSettingRtc();
+  testRtcSampleTimestampTracksCompleteReadsOnly();
   testInvalidBcdAndImpossibleCalendar();
   testTwelveHourDecoding();
   testExplicitSetAndStrictValidation();

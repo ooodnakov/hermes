@@ -214,6 +214,7 @@ bool Sensors::setRtcDateTime(int year, int month, int day, int hour, int minute,
   state_.rtcHour = static_cast<uint8_t>(hour);
   state_.rtcMinute = static_cast<uint8_t>(minute);
   state_.rtcSecond = static_cast<uint8_t>(second);
+  state_.rtcSampledAtMs = millis();
   rtcSetFailed_ = false;
   return true;
 }
@@ -302,6 +303,7 @@ void Sensors::sampleRtc() {
     return;
   }
   state_.rtcReady = true;
+  state_.rtcSampledAtMs = millis();
   // The seconds OS flag means oscillator integrity is not guaranteed until
   // cleared by an explicit valid time set.
   const uint8_t seconds = time[0] & 0x7f;

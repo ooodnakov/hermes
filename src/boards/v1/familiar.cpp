@@ -102,6 +102,7 @@ void sendHello(const char* transport) {
 }
 
 void sendDiagnostic() {
+  const uint32_t uptimeMs = millis();
   const auto& sensor = sensors.snapshot();
   const auto& touchDiag = touch.diagnostics();
   JsonDocument diagnostic;
@@ -157,6 +158,9 @@ void sendDiagnostic() {
   diagnostic["rtc_hour"] = sensor.rtcHour;
   diagnostic["rtc_minute"] = sensor.rtcMinute;
   diagnostic["rtc_second"] = sensor.rtcSecond;
+  diagnostic["rtc_sampled_at_ms"] = sensor.rtcSampledAtMs;
+  diagnostic["rtc_sample_age_ms"] = uptimeMs - sensor.rtcSampledAtMs;
+  diagnostic["uptime_ms"] = uptimeMs;
   diagnostic["rtc_errors"] = sensor.rtcErrors;
   diagnostic["imu_ready"] = sensor.imuReady;
   diagnostic["imu_config_ready"] = sensor.imuConfigReady;
