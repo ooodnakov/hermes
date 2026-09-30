@@ -31,7 +31,7 @@ struct TouchDiagnostics {
   TouchStatus lastStatus = TouchStatus::Error;
 };
 
-// Borrows an already initialized TwoWire instance; V1 uses Wire1 on GPIO17/18.
+// Borrows an initialized TwoWire instance; the board caller owns bus setup.
 class Axs15231bTouch {
  public:
   explicit Axs15231bTouch(TwoWire& bus) : bus_(bus) {}

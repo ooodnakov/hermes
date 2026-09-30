@@ -14,6 +14,12 @@ constexpr uint8_t kReleaseConfirmSamples = 2;
 void increment(uint32_t& value) {
   if (value != UINT32_MAX) ++value;
 }
+
+void invalidateTouch(bool& touchActive, uint8_t& emptyTouchSamples, TouchPoint& lastPoint) {
+  touchActive = false;
+  emptyTouchSamples = 0;
+  lastPoint = {};
+}
 }
 
 bool Axs15231bTouch::read(TouchPoint& point) {
@@ -27,12 +33,14 @@ TouchStatus Axs15231bTouch::readSample(TouchPoint& point) {
   bus_.beginTransmission(kAddress);
   if (bus_.write(kReadCommand, sizeof(kReadCommand)) != sizeof(kReadCommand)) {
     increment(diagnostics_.busErrors);
+    invalidateTouch(touchActive_, emptyTouchSamples_, lastPoint_);
     diagnostics_.lastStatus = TouchStatus::Error;
     return TouchStatus::Error;
   }
   diagnostics_.lastWireError = bus_.endTransmission(false);
   if (diagnostics_.lastWireError != 0) {
     increment(diagnostics_.busErrors);
+    invalidateTouch(touchActive_, emptyTouchSamples_, lastPoint_);
     diagnostics_.lastStatus = TouchStatus::Error;
     return TouchStatus::Error;
   }
@@ -40,12 +48,14 @@ TouchStatus Axs15231bTouch::readSample(TouchPoint& point) {
   if (received != kResponseBytes) {
     while (bus_.available()) bus_.read();
     increment(diagnostics_.shortReads);
+    invalidateTouch(touchActive_, emptyTouchSamples_, lastPoint_);
     diagnostics_.lastStatus = TouchStatus::Error;
     return TouchStatus::Error;
   }
   for (size_t i = 0; i < sizeof(response); ++i) {
     if (!bus_.available()) {
       increment(diagnostics_.shortReads);
+      invalidateTouch(touchActive_, emptyTouchSamples_, lastPoint_);
       diagnostics_.lastStatus = TouchStatus::Error;
       return TouchStatus::Error;
     }
@@ -75,6 +85,7 @@ TouchStatus Axs15231bTouch::readSample(TouchPoint& point) {
   const uint16_t rawShortAxis = static_cast<uint16_t>(((response[4] & 0x0F) << 8) | response[5]);
   if (rawLongAxis > kRawLongAxisMax || rawShortAxis > kRawShortAxisMax) {
     increment(diagnostics_.outOfRange);
+    invalidateTouch(touchActive_, emptyTouchSamples_, lastPoint_);
     diagnostics_.lastStatus = TouchStatus::Error;
     return TouchStatus::Error;
   }
