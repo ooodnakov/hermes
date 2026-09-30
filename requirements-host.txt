@@ -1,0 +1,6 @@
+# Standalone bridge and optional plugin network transports.
+pyserial>=3.5
+websockets>=12
+
+# Required only by scripts/export_sd_pack.py and scripts/make_terminal_frames.py.
+Pillow>=10

@@ -1,13 +1,13 @@
 """voice — give the familiar a real voice.
 
 Pipeline: text → Hermes' own TTS (tools.tts_tool, provider/voice from the
-user's ``tts:`` config — ElevenLabs here) → afconvert to 16 kHz mono s16le →
+user's ``tts:`` config) → FFmpeg (Linux) or afconvert (macOS) to 16 kHz mono s16le →
 raw PCM file → served over a tiny LAN HTTP server → the device streams it
 straight into its I2S speaker (no transcoding on-device; the I2S bus runs at
 exactly this format).
 
 USB serial stays the control channel; Wi-Fi only carries audio. Everything
-degrades quietly: no TTS provider / no afconvert / port taken / device not on
+degrades quietly: no TTS provider / no converter / port taken / device not on
 Wi-Fi → banners and chirps still work, speech is skipped.
 """
 from __future__ import annotations
@@ -20,9 +20,10 @@ import logging
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
-import wave
+import shutil
 from pathlib import Path
 
 logger = logging.getLogger("familiar.voice")
@@ -51,6 +52,14 @@ def audio_dir() -> Path:
 
 
 def lan_ip() -> str | None:
+    """Return an explicitly advertised host, or detect the default LAN address.
+
+    Set HERMES_ADVERTISED_HOST when the host is behind WSL/NAT and the address
+    selected by the UDP route probe is not reachable from the ESP32.
+    """
+    configured = os.environ.get("HERMES_ADVERTISED_HOST", "").strip()
+    if configured:
+        return configured
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -79,7 +88,7 @@ def start_server(port: int = _PORT) -> bool:
         return False
     threading.Thread(target=srv.serve_forever, name="familiar-audio", daemon=True).start()
     _server_ok = True
-    logger.info("familiar audio server on :%d serving %s", port, _serve_dir)
+    logger.info("familiar audio server on 0.0.0.0:%d serving %s", port, _serve_dir)
     return True
 
 
@@ -113,15 +122,34 @@ def _tts_render(text: str) -> Path | None:
 
 
 def _to_pcm16k(src: Path) -> Path | None:
-    """Any audio file -> raw s16le 16 kHz mono via afconvert (macOS builtin)."""
-    wav = src.with_suffix(".16k.wav")
+    """Convert audio to raw signed 16-bit little-endian mono 16 kHz PCM."""
+    converter = "ffmpeg" if sys.platform != "darwin" else "afconvert"
+    executable = shutil.which(converter)
     try:
-        subprocess.run(
-            ["afconvert", str(src), "-d", "LEI16@16000", "-c", "1",
-             "-f", "WAVE", str(wav)],
-            check=True, capture_output=True, timeout=30)
-        with wave.open(str(wav), "rb") as w:
-            frames = w.readframes(w.getnframes())
+        if not executable:
+            logger.warning("%s not found — install %s to enable familiar speech",
+                           converter, "FFmpeg" if converter == "ffmpeg" else "macOS audio tools")
+            return None
+        if converter == "ffmpeg":
+            result = subprocess.run(
+                [executable, "-v", "error", "-i", str(src), "-f", "s16le",
+                 "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "pipe:1"],
+                check=True, capture_output=True, timeout=30)
+            frames = result.stdout
+        else:
+            wav = src.with_suffix(".16k.wav")
+            subprocess.run(
+                [executable, str(src), "-d", "LEI16@16000", "-c", "1",
+                 "-f", "WAVE", str(wav)],
+                check=True, capture_output=True, timeout=30)
+            import wave
+            with wave.open(str(wav), "rb") as w:
+                if w.getframerate() != 16000 or w.getnchannels() != 1 or w.getsampwidth() != 2:
+                    raise ValueError("afconvert output did not match 16 kHz mono s16le")
+                frames = w.readframes(w.getnframes())
+            wav.unlink(missing_ok=True)
+        if not frames or len(frames) % 2:
+            raise ValueError("converter returned empty or malformed 16-bit PCM")
         if _volume < 0.999:
             samples = array.array("h")
             samples.frombytes(frames)
@@ -131,15 +159,13 @@ def _to_pcm16k(src: Path) -> Path | None:
         pcm = src.with_suffix(".pcm")
         pcm.write_bytes(frames)
         return pcm
-    except FileNotFoundError:
-        logger.warning("afconvert not found — voice off")
-        return None
     except Exception:
         logger.exception("familiar pcm convert failed")
         return None
     finally:
-        wav.unlink(missing_ok=True)
         src.unlink(missing_ok=True)
+        if sys.platform == "darwin":
+            src.with_suffix(".16k.wav").unlink(missing_ok=True)
 
 
 def say_url(text: str, port: int = _PORT) -> str | None:
