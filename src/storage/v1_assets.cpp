@@ -125,7 +125,10 @@ bool V1Assets::begin() {
   sdReady_ = true;
   // Recover a completed backup if power failed between the two FAT renames.
   if (!SD_MMC.exists(kConfigPath) && SD_MMC.exists(kConfigBackup)) {
-    if (!SD_MMC.rename(kConfigBackup, kConfigPath)) record(AssetError::ConfigRename);
+    if (!SD_MMC.rename(kConfigBackup, kConfigPath)) {
+      record(AssetError::ConfigRename);
+      return true;
+    }
   }
   record(AssetError::None);
   return true;
@@ -380,6 +383,11 @@ bool V1Assets::writeJsonAtomically(const JsonDocument& doc) {
 
 bool V1Assets::mergeConfiguration(JsonObjectConst updates) {
   if (!sdReady_) { record(AssetError::SdMount); return false; }
+  if (!SD_MMC.exists(kConfigPath) && SD_MMC.exists(kConfigBackup) &&
+      !SD_MMC.rename(kConfigBackup, kConfigPath)) {
+    record(AssetError::ConfigRename);
+    return false;
+  }
   JsonDocument config;
   if (SD_MMC.exists(kConfigPath)) {
     File existing = SD_MMC.open(kConfigPath, FILE_READ);
