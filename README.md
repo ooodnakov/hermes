@@ -111,10 +111,16 @@ What the device shows/does in plugin mode:
 - **Message ticker** — your messages (`u:`) and Hermes replies (`a:`) land on
   Page 1 as they happen; every reply also toasts a gold `> HERMES:` banner in
   the bottom band for 4s on whatever page you're on.
-- **Latest response viewer (3.49 V1 firmware)** — tap the latest response on
-  Page 0 or the newest entry on Page 1 to open its Markdown-formatted text;
-  swipe vertically to read longer responses and tap to return. Long responses
-  may be shortened to fit the device protocol limit.
+- **Message cards (V1 firmware)** — Page 1 shows two recent-message cards,
+  each 55 px high. Tap a card to read its full retained text; swipe vertically
+  to browse one entry at a time across batches of five, then tap to return to
+  the same card position. Text may be shortened to fit the device protocol.
+- **Latest response viewer** — Page 0 keeps the latest assistant response in
+  its Markdown viewer. The two-card history reader is separate from that view.
+- **Current rollout** — the messages/emoji V1 image is flashed and hash-
+  verified (`85029efd3a33f3f547cc8c844e34224f9c463ad1182b3f8aa58f12f1e5bfe90e`).
+  The matching host plugin changes remain local and are not deployed to the
+  gateway, so the board still receives preview-only message records.
 - **Inline emoji and icons (3.49 V1 firmware)** — messages, notifications,
   labels, and Markdown display colour emoji, including flags, skin tones, and
   joined sequences, plus Meslo Nerd Font icons. Twemoji artwork by Twitter, Inc.
@@ -264,7 +270,10 @@ latest message or touch
 
 Page 1: recent messages
 
-Shows recent Hermes user/assistant lines from the local state DB.
+Shows the latest user and assistant messages as two cards. Tap either card to
+open its retained text. Swipe vertically to move one message at a time through
+the five-entry history batches; tap to return to Page 1 at the same position.
+Older host records that only have a compact preview may not have full text.
 
 Page 2: actions
 
@@ -310,10 +319,22 @@ Example SD Wi-Fi config:
 Host to device:
 
 ```json
-{"type":"state","running":1,"waiting":0,"mood":"thinking","msg":"...","job_state":"running","job_label":"Status brief"}
+{"type":"state","running":1,"waiting":0,"msg":"...","entries":["12:04 u: …"],"entry_ids":["7c9a4fd33e6744c9a1b2c3d4e5f60718-1"],"job_state":"running","job_label":"Status brief"}
+{"type":"msgs","off":0,"total":9,"lines":["12:04 u: …"],"ids":["7c9a4fd33e6744c9a1b2c3d4e5f60718-1"]}
+{"type":"msg","id":"7c9a4fd33e6744c9a1b2c3d4e5f60718-1","body":"Full retained message text","role":"user","truncated":false}
 {"type":"event","event":"message","role":"assistant","msg":"..."}
 {"type":"ack","msg":"started: Status brief"}
 ```
+
+`entry_ids` and `msgs.ids` are optional parallel arrays for the existing
+`entries` and `lines` fields. Firmware can request a selected record with
+`{"cmd":"msg","id":"…"}`. The host retains at most 40 detail records and
+caps each stored body at 16 KiB. A detail response is capped at 3200 UTF-8
+body bytes and at 4095 bytes for the complete JSON frame as escaped on the
+wire, so non-ASCII text may be shortened further; `truncated` reports this.
+An evicted or unknown ID returns an empty body with `error:"stale"`. A
+preview-only record returns `error:"unavailable"` rather than presenting its
+compact preview as full text.
 
 Device to host:
 
@@ -323,6 +344,8 @@ Device to host:
 {"cmd":"action","action":"start"}
 {"cmd":"action","action":"pause"}
 {"cmd":"action","action":"cancel"}
+{"cmd":"msgs","off":0}
+{"cmd":"msg","id":"7c9a4fd33e6744c9a1b2c3d4e5f60718-1"}
 {"cmd":"permission","decision":"once"}
 {"event":"local_auto","mood":"blink"}
 ```

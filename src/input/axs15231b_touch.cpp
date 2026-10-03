@@ -91,9 +91,10 @@ TouchStatus Axs15231bTouch::readSample(TouchPoint& point) {
   }
 
   // The panel presenter maps logical (x, y) to native
-  // (nativeX=171-y, nativeY=x). The controller's short axis is nativeX and
-  // long axis is nativeY, so invert the short axis when mapping back.
-  point.x = rawLongAxis;
+  // (nativeX=171-y, nativeY=x). Based on the reported touch behavior, the
+  // controller's horizontal polarity is reversed relative to the image, so
+  // mirror x and keep the existing vertical mapping.
+  point.x = static_cast<uint16_t>(kRawLongAxisMax - rawLongAxis);
   point.y = static_cast<uint16_t>(171 - rawShortAxis);
   touchActive_ = true;
   lastPoint_ = point;

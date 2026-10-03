@@ -24,6 +24,33 @@ A full state frame is also sent as a 5 s heartbeat (firmware marks the host
 offline after 30 s). Daily aggregates (sessions/tokens/tools) are read from
 `state.db` read-only at most once a minute.
 
+On V1, Page 1 presents two 55 px message cards. Tapping a card opens that
+entry's retained text; vertical swipes browse one entry at a time through
+five-entry history batches, and tapping returns to the prior card position.
+Page 0's latest-response Markdown viewer remains available separately.
+
+The plugin adds optional `entry_ids` beside the existing state `entries` and
+`ids` beside the existing history `lines`. A selected entry is requested with
+`{"cmd":"msg","id":"…"}` and returned as
+`{"type":"msg","id":"…","body":"…","role":"user|assistant|…","truncated":false}`.
+The ID arrays preserve the existing preview fields for older firmware. The
+host retains at most 40 detail records, with each stored body capped at 16 KiB
+of UTF-8. A detail response is limited to 3200 UTF-8 body bytes and a 4095-byte
+complete escaped JSON frame; the latter can shorten non-ASCII text further.
+The `truncated` flag reports clipping. A stale or unknown ID returns an empty
+body with `error:"stale"`; a preview-only legacy record returns
+`error:"unavailable"` so its compact preview is not presented as full text.
+
+Current rollout: the V1 messages/emoji image is flashed and hash-verified as
+`85029efd3a33f3f547cc8c844e34224f9c463ad1182b3f8aa58f12f1e5bfe90e`. This
+checkout's host plugin changes have not been deployed or live-updated in the
+gateway, so the connected device still receives preview-only records and the
+selected-message detail path is not yet available end to end. The existing
+Page 0 Markdown viewer remains in the image, though the user reports that
+Markdown formatting broke on the physical board. Treat this as an observed
+regression, not a formatting pass; do not infer a cause or investigate/fix it
+until asked.
+
 Additional host→device frames (v0.3.0):
 
 | Frame | Device effect |
@@ -31,6 +58,8 @@ Additional host→device frames (v0.3.0):
 | `{"type":"notify","msg":"…","sound":"alert\|ack\|tap\|none","secs":8}` | banner toast on any page + chirp (`familiar_notify` agent tool) |
 | `{"type":"page","slot":0\|1,"title":"…","lines":["…","…"]}` | fills Page 4 (cron, slot 0) / Page 5 (vitals, slot 1); pushed every 60 s from `plugin/feeds.py` |
 | `{"type":"config","wifi":{"ssid":"…","password":"…"}}` | merges into SD `/hermes-buddy/config.json`, acks `{"ack":"config",…}`, reconnects Wi-Fi live |
+| `{"type":"msgs","off":0,"total":9,"lines":["…"],"ids":["…"]}` | returns up to five history previews and their optional stable detail IDs |
+| `{"type":"msg","id":"…","body":"…","role":"user|assistant|…","truncated":false}` | selected full-text detail response; may include `error:"stale"` or `error:"unavailable"` |
 
 `event:message` frames also raise a 4 s banner toast; toasts never cover a
 pending approval and are dismissed by page navigation.
@@ -50,6 +79,8 @@ gateway.
 | `{"cmd":"action","action":"start"}` | run first enabled action from `~/.hermes/familiar_actions.json` as a `hermes chat -q` subprocess |
 | `{"cmd":"action","action":"pause"}` / `"cancel"` | SIGSTOP/SIGCONT / SIGTERM the job's process group |
 | `{"cmd":"permission","decision":"once"\|"deny","id":<session_key>}` | `tools.approval.resolve_gateway_approval(session_key, decision)` — the exact call `/approve` and `/deny` make |
+| `{"cmd":"msgs","off":0}` | return the selected five-entry history batch; response keeps `lines` and adds parallel `ids` |
+| `{"cmd":"msg","id":"…"}` | return full retained text for the selected entry, when available |
 | `{"cmd":"gesture","gesture":"shake"}` | ack event |
 
 ### Process safety

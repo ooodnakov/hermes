@@ -91,6 +91,182 @@ void testTabBoundariesAndDeckGaps() {
   assert(count(sent, "\"cmd\":\"deck\"") == deckCommands);
 }
 
+void testMessageCardGeometryTapAndModalReturn() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Messages;
+  state.entryCount = 3;
+  state.entries[0] = "14:10 u: first user preview";
+  state.entries[1] = "14:11 a: second assistant preview";
+  state.entries[2] = "14:12 u: third user preview";
+  state.entryIds[0] = "first-user";
+  state.entryIds[1] = "second-assistant";
+  state.entryIds[2] = "third-user";
+  state.agentResponseMarkdown = "**unrelated latest response**";
+  const ui::Rect first = ui::FamiliarUi::messageCardRect(0);
+  const ui::Rect second = ui::FamiliarUi::messageCardRect(1);
+  assert(first.x == 8 && first.w == 624 && first.h >= 54 && first.h <= 56);
+  assert(second.x == first.x && second.w == first.w && second.h == first.h);
+  assert(first.y >= 48 && first.y + first.h < second.y);
+  assert(second.y + second.h <= ui::FamiliarUi::kHeight);
+  assert(ui::FamiliarUi::messageCardRect(2).w == 0);
+
+  view.render(10);
+  assert(textHas(sprite, "USER"));
+  assert(textHas(sprite, "ASSISTANT"));
+  assert(textHas(sprite, "OPEN >"));
+  assert(textHas(sprite, "first user preview"));
+  assert(textHas(sprite, "second assistant preview"));
+
+  tap(view, 300, first.y + first.h + 1, 11);
+  assert(!state.modalActive); // Card gap stays inert.
+  tap(view, second.x + second.w / 2, second.y + second.h / 2, 12);
+  assert(state.modalActive && state.modalReturn == protocol::Page::Messages);
+  assert(state.modalBody == "second assistant preview");
+  assert(!textHas(sprite, "unrelated latest response"));
+  tap(view, 300, 90, 13);
+  assert(!state.modalActive && state.page == protocol::Page::Messages);
+  view.render(14);
+  assert(textHas(sprite, "first user preview"));
+  assert(textHas(sprite, "second assistant preview")); // Second-card open kept the viewport.
+  state.entries[0] = "14:13 a: new live entry";
+  state.entries[1] = "14:10 u: first user preview";
+  state.entries[2] = "14:11 a: second assistant preview";
+  state.entryIds[0] = "new-live";
+  state.entryIds[1] = "first-user";
+  state.entryIds[2] = "second-assistant";
+  view.render(15);
+  assert(textHas(sprite, "first user preview"));
+  assert(textHas(sprite, "second assistant preview"));
+  view.touchGesture(320, 80, 250, 80, 200, 16);
+  assert(state.page == protocol::Page::Operations); // Horizontal tabs still navigate.
+}
+
+void testMessageBrowsingLocalHistoryAndDetailRequest() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Messages;
+  state.entryCount = 5;
+  for (uint8_t i = 0; i < 5; ++i) {
+    state.entries[i] = String("14:0") + String(i) + " a: local entry " + String(i);
+    state.entryIds[i] = String("local-") + String(i);
+  }
+  view.render(99);
+  assert(textHas(sprite, "local entry 0") && textHas(sprite, "local entry 1"));
+  for (uint8_t i = 0; i < 4; ++i) {
+    view.touchGesture(300, 120, 300, 70, 200, 100 + i);
+    assert(!has(sent, "\"cmd\":\"msgs\""));
+    assert(!state.modalActive); // A vertical browse gesture never acts as a tap.
+    view.render(110 + i);
+    assert(textHas(sprite, "local entry " + std::to_string(i + 1)));
+  }
+  view.touchGesture(300, 120, 300, 70, 200, 120);
+  assert(has(sent, "\"cmd\":\"msgs\""));
+  assert(has(sent, "\"off\":5"));
+  state.historyOffset = 5;
+  state.historyCount = 5;
+  state.historyTotal = 15;
+  for (uint8_t i = 0; i < 5; ++i) {
+    state.history[i] = String("14:1") + String(i) + " u: history entry " + String(i);
+    state.historyIds[i] = String("history-") + String(i);
+  }
+  view.render(121);
+  assert(textHas(sprite, "history entry 0"));
+  for (uint8_t i = 0; i < 4; ++i) {
+    view.touchGesture(300, 120, 300, 70, 200, 130 + i);
+    view.render(135 + i);
+    assert(textHas(sprite, "history entry " + std::to_string(i + 1)));
+  }
+  view.touchGesture(300, 120, 300, 70, 200, 140);
+  assert(has(sent, "\"off\":10"));
+  state.historyOffset = 10;
+  view.render(141);
+  state.historyTotal = 12;
+  state.historyCount = 2;
+  state.history[0] = "14:20 a: final older 0";
+  state.history[1] = "14:21 a: final older 1";
+  view.render(142);
+  view.touchGesture(300, 70, 300, 120, 200, 150);
+  assert(state.historyOffset == 10); // The final batch cannot request older entries.
+  view.touchGesture(300, 70, 300, 120, 200, 151);
+  view.touchGesture(300, 70, 300, 120, 200, 152);
+
+  // Move newer across batches, then return from offset five to the live tail.
+  assert(has(sent, "\"off\":5"));
+  state.historyOffset = 5;
+  state.historyCount = 5;
+  view.render(153);
+  for (uint8_t i = 0; i < 4; ++i)
+    view.touchGesture(300, 70, 300, 120, 200, 160 + i);
+  view.touchGesture(300, 70, 300, 120, 200, 170);
+  assert(state.historyOffset == 0); // Newer reaches the live tail locally.
+  for (uint8_t i = 0; i < 4; ++i)
+    view.touchGesture(300, 70, 300, 120, 200, 180 + i);
+  view.touchGesture(300, 70, 300, 120, 200, 190);
+  assert(state.historyOffset == 0 && !has(sent, "\"off\":0"));
+
+  state.entryIds[0] = "detail \"id\"";
+  const String previewBefore = state.entries[0];
+  view.render(200);
+  const ui::Rect first = ui::FamiliarUi::messageCardRect(0);
+  tap(view, first.x + 10, first.y + 10, 201);
+  assert(state.modalActive && state.messageDetailPending);
+  assert(state.messageDetailRequestedId == "detail \"id\"");
+  assert(has(sent, "\"cmd\":\"msg\""));
+  assert(has(sent, "detail \\\"id\\\""));
+  view.render(202);
+  assert(textHas(sprite, "loading full message"));
+  tap(view, 400, 100, 203);
+  assert(!state.messageDetailPending && state.messageDetailRequestedId.length() == 0);
+  assert(state.entries[0] == previewBefore);
+}
+
+void testMessageIdentitySurvivesReorderAndSamePreview() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Messages;
+  state.entryCount = 3;
+  for (uint8_t i = 0; i < 3; ++i)
+    state.entries[i] = "14:30 a: repeated preview";
+  state.entryIds[0] = "message-a";
+  state.entryIds[1] = "message-b";
+  state.entryIds[2] = "message-c";
+  view.touchGesture(300, 120, 300, 70, 200, 10);
+
+  // A live state update can reorder identical previews; keep message-b selected.
+  state.entryIds[0] = "message-b";
+  state.entryIds[1] = "message-a";
+  view.render(11);
+  const ui::Rect first = ui::FamiliarUi::messageCardRect(0);
+  tap(view, first.x + 10, first.y + 10, 12);
+  assert(state.messageDetailRequestedId == "message-b");
+  assert(has(sent, "message-b"));
+  state.messageDetailBody = "Full text for message-b";
+  state.messageDetailRole = "assistant";
+  state.messageDetailPending = false;
+  view.render(13);
+  assert(textHas(sprite, "Full text for message-b"));
+  tap(view, 400, 100, 14);
+
+  // Keep the cursor bound to the same ID after dismissal and another reorder.
+  state.entryIds[0] = "message-c";
+  state.entryIds[1] = "message-b";
+  view.render(15);
+  assert(textHas(sprite, "repeated preview"));
+  tap(view, first.x + 10, first.y + 10, 16);
+  assert(state.messageDetailRequestedId == "message-b");
+  view.render(8016); // Request timeout falls back to its selected preview.
+  assert(!state.messageDetailPending);
+  assert(state.messageDetailError == "timeout");
+  assert(textHas(sprite, "full text unavailable"));
+}
+
 void testConfirmExpiry() {
   lgfx::LGFX_Sprite sprite;
   protocol::UiState state;
@@ -196,22 +372,6 @@ void testSwipeCannotResolveApprovalAndModalReturnsToOrigin() {
   assert(!state.modalActive && state.page == protocol::Page::Fleet);
 }
 
-void testMessageHistoryRequests() {
-  lgfx::LGFX_Sprite sprite;
-  protocol::UiState state;
-  Capture sent;
-  ui::FamiliarUi view(sprite, state, capture, &sent);
-  state.page = protocol::Page::Messages;
-  view.touchGesture(300, 120, 300, 60, 220, 1000);
-  assert(has(sent, "\"cmd\":\"msgs\""));
-  assert(has(sent, "\"off\":5"));
-  sent.lines.clear();
-  state.historyOffset = 10;
-  view.touchGesture(300, 60, 300, 120, 220, 1100);
-  assert(has(sent, "\"cmd\":\"msgs\""));
-  assert(has(sent, "\"off\":5"));
-}
-
 void testUtf8TypographyMeasuredWrappingAcrossPages() {
   lgfx::LGFX_Sprite sprite;
   protocol::UiState state;
@@ -283,11 +443,11 @@ void testUtf8TypographyMeasuredWrappingAcrossPages() {
 
   state.page = protocol::Page::Messages;
   view.render(400);
-  assert(textHas(sprite, "RECENT TRAFFIC") || textHas(sprite, "HISTORY"));
+  assert(textHas(sprite, "MESSAGES") || textHas(sprite, "HISTORY"));
   assertTextCallsFit(sprite);
   state.historyOffset = 0;
   view.render(401);
-  assert(textHas(sprite, "RECENT TRAFFIC"));
+  assert(textHas(sprite, "MESSAGES"));
   assertTextCallsFit(sprite);
 
   state.page = protocol::Page::Operations;
@@ -583,19 +743,22 @@ void testLatestResponseOpensScrollableModalFromFaceAndMessages() {
 
   state.page = protocol::Page::Messages;
   state.entryCount = 1;
-  state.entries[0] = "Latest response preview";
+  state.entries[0] = "14:32 a: Latest response preview";
   tap(view, 50, 50, 106);
   assert(state.modalActive && state.modalReturn == protocol::Page::Messages);
-  assert(state.modalBody == "## Replacement B");
+  assert(state.modalBody == "Latest response preview");
+  assert(!textHas(sprite, "Replacement B"));
 }
 }  // namespace
 
 int main() {
   testTabBoundariesAndDeckGaps();
+  testMessageCardGeometryTapAndModalReturn();
+  testMessageBrowsingLocalHistoryAndDetailRequest();
+  testMessageIdentitySurvivesReorderAndSamePreview();
   testConfirmExpiry();
   testApprovalRequiresLiveCurrentRequestAndExactButtons();
   testSwipeCannotResolveApprovalAndModalReturnsToOrigin();
-  testMessageHistoryRequests();
   testUtf8TypographyMeasuredWrappingAcrossPages();
   testEmojiClustersAndCodepointSafeRendering();
   testEmojiRenderingInPlainAndStyledMarkdownText();

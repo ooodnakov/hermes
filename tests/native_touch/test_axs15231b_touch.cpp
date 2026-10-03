@@ -25,17 +25,33 @@ void setResponse(TwoWire& bus, const std::array<uint8_t, 8>& bytes) {
   bus.response.assign(bytes.begin(), bytes.end());
 }
 
-void testMappingBoundaries() {
+void testMappingCorners() {
   TwoWire bus;
   input::Axs15231bTouch touch(bus);
   input::TouchPoint point{};
   setResponse(bus, packet(1, 639, 171));
-  require(touch.readSample(point) == input::TouchStatus::Pressed, "inclusive upper boundary is pressed");
-  require(point.x == 639 && point.y == 0, "upper boundary preserves logical mapping");
+  require(touch.readSample(point) == input::TouchStatus::Pressed, "raw upper-left corner sample is pressed");
+  require(point.x == 0 && point.y == 0, "raw upper-left corner maps to logical upper-left");
+  require(touch.diagnostics().x == 0 && touch.diagnostics().y == 0,
+          "upper-left touch diagnostics report mirrored logical coordinates");
+
+  setResponse(bus, packet(1, 0, 171));
+  require(touch.readSample(point) == input::TouchStatus::Pressed, "raw upper-right corner sample is pressed");
+  require(point.x == 639 && point.y == 0, "raw upper-right corner maps to logical upper-right");
+  require(touch.diagnostics().x == 639 && touch.diagnostics().y == 0,
+          "upper-right touch diagnostics report logical coordinates");
+
+  setResponse(bus, packet(1, 639, 0));
+  require(touch.readSample(point) == input::TouchStatus::Pressed, "raw lower-left corner sample is pressed");
+  require(point.x == 0 && point.y == 171, "raw lower-left corner maps to logical lower-left");
+  require(touch.diagnostics().x == 0 && touch.diagnostics().y == 171,
+          "lower-left touch diagnostics report mirrored logical coordinates");
 
   setResponse(bus, packet(1, 0, 0));
-  require(touch.readSample(point) == input::TouchStatus::Pressed, "inclusive lower boundary is pressed");
-  require(point.x == 0 && point.y == 171, "lower boundary preserves logical mapping");
+  require(touch.readSample(point) == input::TouchStatus::Pressed, "raw lower-right corner sample is pressed");
+  require(point.x == 639 && point.y == 171, "raw lower-right corner maps to logical lower-right");
+  require(touch.diagnostics().x == 639 && touch.diagnostics().y == 171,
+          "lower-right touch diagnostics report logical coordinates");
 }
 
 void testReleaseDebounce() {
@@ -47,7 +63,7 @@ void testReleaseDebounce() {
   require(touch.readSample(held) == input::TouchStatus::Pressed, "initial press is reported");
   setResponse(bus, packet(0));
   require(touch.readSample(held) == input::TouchStatus::Pressed, "first empty sample is debounced");
-  require(held.x == 321 && held.y == 99, "debounce repeats the last valid point");
+  require(held.x == 318 && held.y == 99, "debounce repeats the last valid mirrored point");
   setResponse(bus, packet(0));
   require(touch.readSample(held) == input::TouchStatus::Released, "second empty sample releases");
 }
@@ -80,7 +96,7 @@ void testErrorCancelsPriorTouch(ErrorKind kind, const std::string& name) {
 }  // namespace
 
 int main() {
-  testMappingBoundaries();
+  testMappingCorners();
   testReleaseDebounce();
   testErrorCancelsPriorTouch(ErrorKind::ShortWrite, "short write");
   testErrorCancelsPriorTouch(ErrorKind::Wire, "wire error");

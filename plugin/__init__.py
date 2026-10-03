@@ -35,6 +35,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
@@ -102,10 +103,17 @@ _STATS_REFRESH_SECS = 60.0
 _lock = threading.Lock()
 _MAX_AGENT_MARKDOWN_BYTES = 3072
 _MAX_DEVICE_JSON_BYTES = 4095
+_MAX_DETAIL_BODY_BYTES = 3200
+_MAX_RETAINED_DETAIL_BYTES = 16 * 1024
 _MARKDOWN_CLIPPED_MARKER = "\n\n[Response clipped]"
 _turns: set[str] = set()                  # session_ids with an LLM call in flight
 _pending: OrderedDict[str, str] = OrderedDict()   # approval session_key -> text
 _entries: deque[str] = deque(maxlen=40)   # newest-first ticker; device shows 5, scrollback pages the rest
+_entry_ids: deque[str] = deque(maxlen=40)
+_entry_previews: deque[str] = deque(maxlen=40)
+_entry_details: OrderedDict[str, dict] = OrderedDict()
+_entry_id_prefix = uuid.uuid4().hex  # IDs from a previous process can never resolve here.
+_entry_id_counter = 0
 _msg = "Familiar linked to Hermes"
 _agent_response_markdown = ""
 _agent_response_markdown_truncated = False
@@ -117,7 +125,7 @@ _jobs: _actions.JobManager | None = None
 # Presence: last real interaction per surface, so sound/voice land where
 # Jason actually is. usb/tcp origins = desk, ws = phone.
 _PRESENCE_WINDOW = 300.0                  # seconds; older than this = unknown
-_INTERACTION_CMDS = {"touch", "swipe", "deck", "permission", "action", "gesture", "msgs"}
+_INTERACTION_CMDS = {"touch", "swipe", "deck", "permission", "action", "gesture", "msgs", "msg"}
 _presence = {"desk": 0.0, "phone": 0.0}
 _desk_quiet = False                       # device reported face-down
 _telemetry: dict = {}                     # last device telemetry frame
@@ -142,6 +150,104 @@ def _active_surface() -> str | None:
 
 def _desk_should_be_quiet() -> bool:
     return _desk_quiet or _active_surface() == "phone"
+
+
+def _new_entry_id() -> str:
+    global _entry_id_counter
+    _entry_id_counter += 1
+    return f"{_entry_id_prefix}-{_entry_id_counter:x}"
+
+
+def _sync_entry_ids() -> None:
+    """Repair alignment if legacy fixtures/extensions mutate _entries directly."""
+    if list(_entries) == list(_entry_previews) and len(_entry_ids) == len(_entries):
+        return
+    _entry_ids.clear()
+    _entry_previews.clear()
+    _entry_details.clear()
+    for preview in _entries:
+        _entry_previews.append(preview)
+        _entry_ids.append(_new_entry_id())
+
+
+def _append_entry(preview: str, body: str | None = None, role: str | None = None) -> str:
+    """Append a ticker row and its bounded optional full-text record.
+
+    Caller holds _lock, matching the historic _entries append sites.
+    """
+    _sync_entry_ids()
+    if len(_entries) == _entries.maxlen and _entry_ids:
+        evicted = _entry_ids[-1]
+        _entry_details.pop(evicted, None)
+    entry_id = _new_entry_id()
+    _entries.appendleft(str(preview))
+    _entry_previews.appendleft(str(preview))
+    _entry_ids.appendleft(entry_id)
+    if body is not None:
+        stored, clipped = _utf8_prefix(str(body), _MAX_RETAINED_DETAIL_BYTES)
+        _entry_details[entry_id] = {
+            "body": stored,
+            "role": role or "system",
+            "truncated": clipped,
+        }
+    return entry_id
+
+
+def _entry_id_snapshot(offset: int = 0, count: int = 5) -> list[str]:
+    _sync_entry_ids()
+    return list(_entry_ids)[offset:offset + count]
+
+
+def _fit_detail_response(frame: dict) -> dict:
+    """Fit a detail response into the complete JSON line budget."""
+    body, clipped = _utf8_prefix(str(frame.get("body", "")), _MAX_DETAIL_BODY_BYTES)
+    clipped = clipped or bool(frame.get("truncated"))
+    base = dict(frame)
+
+    def candidate(chars: int) -> dict:
+        out = dict(base)
+        out["body"] = body[:chars]
+        out["truncated"] = clipped or chars < len(body)
+        return out
+
+    full = candidate(len(body))
+    if _wire_json_size(full) <= _MAX_DEVICE_JSON_BYTES:
+        return full
+    low, high, best = 0, len(body), None
+    while low <= high:
+        mid = (low + high) // 2
+        maybe = candidate(mid)
+        if _wire_json_size(maybe) <= _MAX_DEVICE_JSON_BYTES:
+            best = maybe
+            low = mid + 1
+        else:
+            high = mid - 1
+    if best is not None:
+        return best
+    # IDs are internally short; this fallback protects against malformed input.
+    fallback = {"type": "msg", "id": str(frame.get("id", ""))[:64], "body": "",
+                "role": str(frame.get("role", ""))[:32], "truncated": True,
+                "error": str(frame.get("error", "oversize"))[:32]}
+    return fallback
+
+
+def _send_message_detail(entry_id: str) -> None:
+    if _link is None:
+        return
+    entry_id = str(entry_id or "")[:64]
+    with _lock:
+        _sync_entry_ids()
+        if entry_id not in _entry_ids:
+            frame = {"type": "msg", "id": entry_id, "body": "", "role": "",
+                     "truncated": False, "error": "stale"}
+        else:
+            detail = _entry_details.get(entry_id)
+            if detail is None:
+                frame = {"type": "msg", "id": entry_id, "body": "", "role": "",
+                         "truncated": False, "error": "unavailable"}
+            else:
+                frame = {"type": "msg", "id": entry_id, **detail}
+    _link.send(_fit_detail_response(frame))
 
 
 def _tool_status(tool_name: str) -> str:
@@ -238,7 +344,8 @@ def _surface_job_result() -> None:
     ok = res.get("rc", 0) == 0
     stamp = datetime.now().strftime("%H:%M")
     with _lock:
-        _entries.appendleft(f"{stamp} >{label}: {_actions.compact(text, 70)}")
+        _append_entry(f"{stamp} >{label}: {_actions.compact(text, 70)}",
+                      str(res.get("text") or ""), "job")
     _set_msg(f"[{label}] {text}")
     _link.send({"type": "notify", "msg": f"{label}: {text}",
                 "sound": "ack" if ok else "alert"})
@@ -255,7 +362,8 @@ def _loom_tick() -> None:
     stamp = datetime.now().strftime("%H:%M")
     with _lock:
         for ev in events[:6]:
-            _entries.appendleft(f"{stamp} L: {_actions.compact(ev['text'], 70)}")
+            _append_entry(f"{stamp} L: {_actions.compact(ev['text'], 70)}",
+                          str(ev["text"]), "loom")
     loud = [ev for ev in events if ev["speak"]]
     if len(events) > 3 and not loud:
         _push({"type": "notify", "msg": f"Loom: {len(events)} new events", "sound": "tap"})
@@ -309,7 +417,7 @@ def _ritual_tick() -> None:
         logger.info("evening digest (%d chars): %s", len(digest), digest[:160])
         _push({"type": "notify", "msg": "Evening digest — listen", "sound": "none"})
         with _lock:
-            _entries.appendleft(f"{now.strftime('%H:%M')} *: evening digest")
+            _append_entry(f"{now.strftime('%H:%M')} *: evening digest", digest, "assistant")
         url = _say_url(digest)
         if url and _link is not None:
             _link.send({"type": "say", "url": url})
@@ -331,6 +439,7 @@ def _payload() -> dict:
             "waiting": len(_pending),
             "msg": _msg,
             "entries": list(_entries)[:5],
+            "entry_ids": _entry_id_snapshot(0, 5),
             "tokens_today": _stats["tokens_today"],
             "tools_today": _stats["tools_today"],
             "battery_v": round(float(_telemetry.get("bat") or 0.0), 2),
@@ -339,6 +448,11 @@ def _payload() -> dict:
         }
         markdown = _agent_response_markdown
         markdown_truncated = _agent_response_markdown_truncated
+    payload = _fit_message_previews(
+        payload, "entries",
+        reserve={"msg_markdown": _MARKDOWN_CLIPPED_MARKER,
+                 "msg_markdown_truncated": True},
+    )
     return _fit_markdown_state_frame(payload, markdown, markdown_truncated)
 
 
@@ -422,6 +536,34 @@ def _fit_markdown_state_frame(base: dict, markdown: str, was_truncated: bool) ->
     return frame
 
 
+def _fit_message_previews(frame: dict, field: str, reserve: dict | None = None) -> dict:
+    """Shorten preview strings as needed while preserving rows and parallel IDs."""
+    values = frame.get(field)
+    def fits(candidate: dict) -> bool:
+        return _wire_json_size({**candidate, **(reserve or {})}) <= _MAX_DEVICE_JSON_BYTES
+
+    if not isinstance(values, list) or fits(frame):
+        return frame
+    strings = [str(value) for value in values]
+    low, high, best = 0, max((len(value) for value in strings), default=0), None
+    while low <= high:
+        chars = (low + high) // 2
+        candidate = dict(frame)
+        candidate[field] = [value[:chars] for value in strings]
+        if fits(candidate):
+            best = candidate
+            low = chars + 1
+        else:
+            high = chars - 1
+    if best is not None:
+        return best
+    # A non-preview field alone exceeds the frame budget. Empty every preview
+    # but retain row count and parallel IDs for the receiving UI.
+    fallback = dict(frame)
+    fallback[field] = [""] * len(strings)
+    return fallback
+
+
 def _push(extra: dict | None = None) -> None:
     if _link is None:
         return
@@ -455,7 +597,8 @@ def _on_pre_llm(platform="", session_id="", user_message="", **kw):
     with _lock:
         _turns.add(str(session_id or "?"))
         if um:
-            _entries.appendleft(f"{datetime.now().strftime('%H:%M')} u: {um}")
+            _append_entry(f"{datetime.now().strftime('%H:%M')} u: {um}",
+                          str(user_message or ""), "user")
     _set_msg(f"thinking… ({platform})" if platform else "thinking…")
     if _link is not None:
         logger.info("push: thinking platform=%s connected=%s", platform, _link.connected)
@@ -484,7 +627,7 @@ def _on_post_llm(assistant_response="", platform="", session_id="", **kw):
             markdown, _MAX_AGENT_MARKDOWN_BYTES)
         if text:
             stamp = datetime.now().strftime("%H:%M")
-            _entries.appendleft(f"{stamp} a: {_actions.compact(text, 70)}")
+            _append_entry(f"{stamp} a: {_actions.compact(text, 70)}", raw, "assistant")
             _msg = text if not src else f"[{src}] {text}"[:140]
         else:
             _msg = "No text response"
@@ -532,14 +675,16 @@ def _on_post_approval(session_key="", choice="", **kw):
 
 def _on_kanban_claimed(task_id="", assignee="", **kw):
     with _lock:
-        _entries.appendleft(f"{datetime.now().strftime('%H:%M')} k: {assignee or 'worker'} claimed {task_id}")
+        preview = f"{datetime.now().strftime('%H:%M')} k: {assignee or 'worker'} claimed {task_id}"
+        _append_entry(preview)
     _push()
 
 
 def _on_kanban_completed(task_id="", summary="", **kw):
     note = _actions.compact(str(summary or task_id), 60)
     with _lock:
-        _entries.appendleft(f"{datetime.now().strftime('%H:%M')} k: done {note}")
+        _append_entry(f"{datetime.now().strftime('%H:%M')} k: done {note}",
+                      str(summary or task_id), "worker")
     _push()
 
 
@@ -610,10 +755,17 @@ def _handle_device_line(evt: dict, origin: str = "usb") -> None:
         with _lock:
             total = len(_entries)
             off = min(off, max(0, total - 1))
+            _sync_entry_ids()
             lines = list(_entries)[off:off + 5]
+            ids = list(_entry_ids)[off:off + 5]
         if _link is not None:
-            _link.send({"type": "msgs", "off": off, "total": total,
-                        "lines": [_actions.compact(l, 80) for l in lines]})
+            frame = {"type": "msgs", "off": off, "total": total,
+                     "lines": [_actions.compact(l, 80) for l in lines],
+                     "ids": ids}
+            _link.send(_fit_message_previews(frame, "lines"))
+        return
+    if cmd == "msg":
+        _send_message_detail(str(evt.get("id") or ""))
         return
     if cmd == "hello" or "hello" in evt:
         # device (re)booted — teach it where home is (for untethered TCP
@@ -785,7 +937,8 @@ def _tool_notify(args=None, **kw) -> str:
     _link.send(desk_frame, leg="desk")
     _link.send(frame, leg="phone")
     with _lock:
-        _entries.appendleft(f"{datetime.now().strftime('%H:%M')} !: {_actions.compact(msg, 70)}")
+        _append_entry(f"{datetime.now().strftime('%H:%M')} !: {_actions.compact(msg, 70)}",
+                      str(args.get("message") or ""), "notification")
     logger.info("push: notify len=%d sound=%s say=%s route=%s desk_quiet=%s",
                 len(msg), frame["sound"], frame.get("say", "-"),
                 _active_surface() or "everywhere", desk_quiet)

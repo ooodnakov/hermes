@@ -39,6 +39,7 @@ class FamiliarUi {
   static Rect denyRect();
   static Rect approvalTextRect();
   static Rect artRect();
+  static Rect messageCardRect(uint8_t index);
 
  private:
   lgfx::LGFX_Sprite& sprite_;
@@ -53,6 +54,13 @@ class FamiliarUi {
   uint32_t parsedResponseHash_ = 0;
   bool responseParseReady_ = false;
   bool agentResponseModalTruncated_ = false;
+  bool messageDetailModal_ = false;
+  bool pendingHistorySelection_ = false;
+  uint16_t pendingHistoryOffset_ = 0;
+  uint8_t pendingMessageSelection_ = 0;
+  uint8_t messageSelection_ = 0;
+  uint32_t messageDetailRequestedAtMs_ = 0;
+  String messageSelectionId_;
   markdown::Document responseDocument_;
 
   void emit(const String& json);
@@ -60,6 +68,8 @@ class FamiliarUi {
   void drawPage();
   void drawFace();
   void drawMessages();
+  void openMessage(uint8_t index, bool history);
+  void browseMessages(bool older);
   void drawOperations();
   void drawHostPage(const protocol::HostPage& page, const char* fallback);
   void drawModal();

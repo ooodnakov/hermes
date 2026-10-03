@@ -47,6 +47,9 @@ class String {
   friend bool operator==(const String& left, const char* right) {
     return left.value_ == (right ? right : "");
   }
+  friend bool operator==(const String& left, const String& right) {
+    return left.value_ == right.value_;
+  }
 
  private:
   std::string value_;

@@ -196,6 +196,90 @@ def test_markdown_budget_fallback_never_exceeds_device_line_limit():
     assert frame["type"] == "state"
 
 
+def test_selected_message_detail_keeps_full_text_and_fits_wire_frame(wired):
+    ctx, link = wired
+    user_text = "Привет 👋 " * 220
+    familiar._on_pre_llm(user_message=user_text, session_id="detail-test")
+    state = link.frames("state")[-1]
+    entry_id = state["entry_ids"][0]
+    familiar._handle_device_line({"cmd": "msg", "id": entry_id})
+
+    detail = link.frames("msg")[-1]
+    assert detail["id"] == entry_id
+    assert detail["role"] == "user"
+    assert detail["body"].startswith("Привет 👋")
+    assert detail["truncated"] is True
+    assert len(detail["body"]) < len(user_text)
+    assert familiar._wire_json_size(detail) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert detail["body"].encode("utf-8").decode("utf-8") == detail["body"]
+
+
+def test_message_ids_follow_duplicate_previews_and_stale_ids_do_not_substitute(wired):
+    _, link = wired
+    repeated = "same assistant response"
+    familiar._on_post_llm(assistant_response=repeated)
+    first_state = link.frames("state")[-1]
+    first_id = first_state["entry_ids"][0]
+
+    familiar._on_post_llm(assistant_response=repeated)
+    state = link.frames("state")[-1]
+    second_id = state["entry_ids"][0]
+    assert state["entries"][0] == first_state["entries"][0]
+    assert second_id != first_id
+
+    familiar._handle_device_line({"cmd": "msgs", "off": 0})
+    history = link.frames("msgs")[-1]
+    assert history["ids"][:2] == [second_id, first_id]
+    assert history["lines"][:2] == [state["entries"][0], state["entries"][1]]
+
+    for i in range(39):
+        familiar._on_post_llm(assistant_response=f"response {i}")
+    familiar._handle_device_line({"cmd": "msg", "id": first_id})
+    stale = link.frames("msg")[-1]
+    assert stale["id"] == first_id
+    assert stale["body"] == ""
+    assert stale["error"] == "stale"
+
+
+def test_unavailable_legacy_entry_detail_is_reported_without_preview_fallback(wired):
+    _, link = wired
+    with familiar._lock:
+        familiar._entries.appendleft("12:00 k: legacy preview")
+    state = familiar._payload()
+    entry_id = state["entry_ids"][0]
+    familiar._handle_device_line({"cmd": "msg", "id": entry_id})
+    detail = link.frames("msg")[-1]
+    assert detail["error"] == "unavailable"
+    assert detail["body"] == ""
+
+
+def test_unicode_previews_preserve_five_state_and_history_ids_under_frame_cap(wired):
+    _, link = wired
+    inserted_ids = []
+    bodies = {}
+    with familiar._lock:
+        for i in range(5):
+            body = f"full retained body {i}"
+            entry_id = familiar._append_entry(f"Ж👋{i}" * 80, body, "user")
+            inserted_ids.append(entry_id)
+            bodies[entry_id] = body
+
+    state = familiar._payload()
+    expected_ids = list(reversed(inserted_ids))
+    assert state["entry_ids"] == expected_ids
+    assert len(state["entries"]) == len(state["entry_ids"]) == 5
+    assert all(len(preview) < 240 for preview in state["entries"])
+    assert familiar._wire_json_size(state) <= familiar._MAX_DEVICE_JSON_BYTES
+
+    familiar._handle_device_line({"cmd": "msgs", "off": 0})
+    history = link.frames("msgs")[-1]
+    assert len(history["lines"]) == len(history["ids"]) == 5
+    assert history["ids"] == expected_ids
+    assert familiar._wire_json_size(history) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert all(familiar._entry_details[entry_id]["body"] == body
+               for entry_id, body in bodies.items())
+
+
 def test_approval_flow_pushes_permission_and_resolves(wired, monkeypatch):
     ctx, link = wired
     ctx.hooks["pre_approval_request"](command="rm -rf /tmp/x",

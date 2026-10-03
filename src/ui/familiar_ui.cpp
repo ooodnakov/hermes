@@ -126,10 +126,43 @@ std::array<Rect, 3> hostRowRects(lgfx::LGFX_Sprite& sprite, const protocol::Host
   return rects;
 }
 
-int16_t messageRowHeight(uint8_t count) {
-  constexpr int16_t top = 48, bottomPadding = 7;
-  const int16_t available = FamiliarUi::kHeight - top - bottomPadding;
-  return count ? std::max<int16_t>(14, available / count) : 20;
+struct MessageParts {
+  String sender;
+  String time;
+  String preview;
+  uint8_t markerLength = 4;
+};
+
+MessageParts messageParts(const String& line) {
+  const std::string_view text = textView(line);
+  MessageParts parts;
+  constexpr struct { const char* marker; const char* label; uint8_t length; } roles[] = {
+      {" a: ", "ASSISTANT", 4}, {" u: ", "USER", 4}, {" j: ", "JOB", 4},
+      {" l: ", "LOOM", 4}, {" L: ", "LOOM", 4}, {" w: ", "WORKER", 4},
+      {" k: ", "WORKER", 4}, {" n: ", "NOTICE", 4}, {" !: ", "NOTICE", 4},
+      {" *: ", "ASSISTANT", 4}, {" >", "WORKER", 2}};
+  size_t marker = std::string_view::npos;
+  for (const auto& role : roles) {
+    marker = text.find(role.marker);
+    if (marker != std::string_view::npos) {
+      parts.sender = role.label;
+      parts.markerLength = role.length;
+      break;
+    }
+  }
+  if (marker == std::string_view::npos) {
+    parts.sender = "MESSAGE";
+    parts.preview = line;
+    return parts;
+  }
+  parts.time = line.substring(0, static_cast<uint16_t>(marker));
+  size_t bodyStart = marker + parts.markerLength;
+  if (parts.markerLength == 2) {
+    const size_t separator = text.find(": ", bodyStart);
+    if (separator != std::string_view::npos) bodyStart = separator + 2;
+  }
+  parts.preview = line.substring(static_cast<uint16_t>(bodyStart));
+  return parts;
 }
 }
 
@@ -163,6 +196,10 @@ Rect FamiliarUi::allowRect() { return {8, kApprovalTop, 304, kApprovalHeight}; }
 Rect FamiliarUi::denyRect() { return {328, kApprovalTop, 304, kApprovalHeight}; }
 Rect FamiliarUi::approvalTextRect() { return {8, 45, 624, 74}; }
 Rect FamiliarUi::artRect() { return {0, kTabHeight, 144, 144}; }
+Rect FamiliarUi::messageCardRect(uint8_t index) {
+  if (index >= 2) return {0, 0, 0, 0};
+  return {8, static_cast<int16_t>(49 + index * 58), 624, 55};
+}
 
 void FamiliarUi::emit(const String& json) {
   if (emit_) emit_(emitContext_, json);
@@ -177,6 +214,13 @@ void FamiliarUi::tick(uint32_t nowMs) {
   }
   if (state_.armedDeck >= 0 && static_cast<int32_t>(nowMs - state_.armedUntilMs) >= 0) {
     state_.armedDeck = -1;
+    state_.dirty = true;
+  }
+  if (state_.messageDetailPending &&
+      static_cast<uint32_t>(nowMs - messageDetailRequestedAtMs_) >= 8000) {
+    state_.messageDetailPending = false;
+    state_.messageDetailRequestedId = "";
+    state_.messageDetailError = "timeout";
     state_.dirty = true;
   }
 }
@@ -280,25 +324,54 @@ void FamiliarUi::drawFace() {
 
 void FamiliarUi::drawMessages() {
   const bool history = state_.historyOffset > 0 && state_.historyCount > 0;
+  const uint8_t count = history ? state_.historyCount : state_.entryCount;
+  if (pendingHistorySelection_ && state_.historyOffset == pendingHistoryOffset_) {
+    messageSelection_ = pendingMessageSelection_;
+    pendingHistorySelection_ = false;
+    messageSelectionId_ = count && messageSelection_ < count
+        ? (history ? state_.historyIds[messageSelection_] : state_.entryIds[messageSelection_])
+        : String("");
+  } else if (messageSelectionId_.length()) {
+    const String* ids = history ? state_.historyIds : state_.entryIds;
+    bool found = false;
+    for (uint8_t i = 0; i < count; ++i) {
+      if (ids[i] == messageSelectionId_) {
+        messageSelection_ = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) messageSelectionId_ = "";
+  }
+  if (count && messageSelection_ >= count) messageSelection_ = count - 1;
+  if (count && !messageSelectionId_.length()) {
+    const String* ids = history ? state_.historyIds : state_.entryIds;
+    messageSelectionId_ = ids[messageSelection_];
+  }
   char heading[80];
   if (history) {
-    snprintf(heading, sizeof(heading), "HISTORY %u-%u / %u  swipe down for newer",
+    snprintf(heading, sizeof(heading), "HISTORY %u-%u / %u  swipe up/down",
              state_.historyOffset + 1, state_.historyOffset + state_.historyCount,
              state_.historyTotal);
-  } else snprintf(heading, sizeof(heading), "RECENT TRAFFIC   swipe up for history");
+  } else snprintf(heading, sizeof(heading), "MESSAGES  swipe up/down to browse");
   drawText(heading, kContentX, 28, kContentRight - 2 * kContentX, kInk, 1.0f);
-  const uint8_t count = history ? state_.historyCount : state_.entryCount;
-  const int16_t rowHeight = messageRowHeight(count);
-  for (uint8_t i = 0; i < count; ++i) {
-    const int16_t y = 48 + i * rowHeight;
-    const String& line = history ? state_.history[i] : state_.entries[i];
-    drawWrapped(line, kContentX, y, kContentRight - 2 * kContentX, rowHeight - 2,
-                !history && i == 0 ? kInk : kGreen);
-    if (i + 1 < count) sprite_.drawFastHLine(kContentX, y + rowHeight - 2,
-                                             kContentRight - 2 * kContentX, kPanel);
+  for (uint8_t card = 0; card < 2; ++card) {
+    const Rect r = messageCardRect(card);
+    const uint8_t index = static_cast<uint8_t>(messageSelection_ + card);
+    if (index >= count) continue;
+    const String& line = history ? state_.history[index] : state_.entries[index];
+    const MessageParts parts = messageParts(line);
+    const bool selected = card == 0;
+    sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 5, selected ? kGreen : kPanel);
+    drawText(parts.sender + (parts.time.length() ? "  " + parts.time : ""),
+             r.x + 8, r.y + 4, r.w - 104, kDim, 0.9f, false);
+    drawText("OPEN >", r.x + r.w - 72, r.y + 4, 62, selected ? kGreen : kDim,
+             0.9f, false);
+    drawWrapped(parts.preview, r.x + 8, r.y + 19, r.w - 16, r.h - 21,
+                selected ? kInk : kGreen, 1.1f);
   }
   if (!count) {
-    drawText("no messages yet", kContentX, 55, kContentRight - 2 * kContentX, kDim);
+    drawText("no messages yet", kContentX, 68, kContentRight - 2 * kContentX, kDim);
   }
 }
 
@@ -361,9 +434,16 @@ void FamiliarUi::drawModal() {
   if (modalContent().length()) {
     if (agentResponseModal_) drawMarkdownResponse();
     else drawWrapped(modalContent(), 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
-    drawText(agentResponseModal_ && agentResponseModalTruncated_
-                 ? "response shortened - swipe up/down, tap to return"
-                 : "swipe up/down to read - tap to return",
+    const char* footer = agentResponseModal_ && agentResponseModalTruncated_
+        ? "response shortened - swipe up/down, tap to return"
+        : messageDetailModal_ && state_.messageDetailPending
+            ? "loading full message - swipe up/down, tap to return"
+        : messageDetailModal_ && state_.messageDetailError.length()
+            ? "full text unavailable - showing preview"
+        : messageDetailModal_ && state_.messageDetailTruncated
+            ? "available text shortened - swipe up/down, tap to return"
+            : "swipe up/down to read - tap to return";
+    drawText(footer,
              8, 159, 624, kDim, 0.9f, false);
   } else {
     sprite_.setFont(&fonts::efontJA_12);
@@ -690,6 +770,9 @@ void FamiliarUi::selectPage(uint8_t index) {
   state_.modalBody = "";
   state_.toastUntilMs = 0;
   state_.historyOffset = 0;
+  messageSelection_ = 0;
+  messageSelectionId_ = "";
+  pendingHistorySelection_ = false;
   state_.dirty = true;
 }
 
@@ -714,6 +797,8 @@ void FamiliarUi::decideApproval(const char* decision) {
 }
 
 const String& FamiliarUi::modalContent() const {
+  if (messageDetailModal_ && !state_.messageDetailPending &&
+      state_.messageDetailBody.length()) return state_.messageDetailBody;
   return state_.modalBody;
 }
 
@@ -721,20 +806,111 @@ void FamiliarUi::openAgentResponseModal() {
   state_.modalReturn = state_.page;
   state_.modalActive = true;
   agentResponseModal_ = true;
+  messageDetailModal_ = false;
   state_.modalBody = state_.agentResponseMarkdown;
   agentResponseModalTruncated_ = state_.agentResponseMarkdownTruncated;
   responseParseReady_ = false;
   modalScroll_ = 0;
 }
 
+void FamiliarUi::openMessage(uint8_t index, bool history) {
+  const uint8_t count = history ? state_.historyCount : state_.entryCount;
+  if (index >= count) return;
+  const String& line = history ? state_.history[index] : state_.entries[index];
+  const String& id = history ? state_.historyIds[index] : state_.entryIds[index];
+  const MessageParts parts = messageParts(line);
+
+  state_.modalReturn = state_.page;
+  state_.modal.title = parts.sender + " MESSAGE";
+  state_.modalBody = parts.preview;
+  state_.modalActive = true;
+  agentResponseModal_ = false;
+  agentResponseModalTruncated_ = false;
+  messageDetailModal_ = id.length() > 0;
+  state_.messageDetailRequestedId = id;
+  state_.messageDetailPending = id.length() > 0;
+  state_.messageDetailBody = "";
+  state_.messageDetailRole = parts.sender;
+  state_.messageDetailError = "";
+  state_.messageDetailTruncated = false;
+  messageDetailRequestedAtMs_ = nowMs_;
+  modalScroll_ = 0;
+  if (id.length()) {
+    JsonDocument document;
+    document["cmd"] = "msg";
+    document["id"] = id;
+    String request;
+    serializeJson(document, request);
+    emit(request);
+  }
+}
+
+void FamiliarUi::browseMessages(bool older) {
+  const bool history = state_.historyOffset > 0 && state_.historyCount > 0;
+  const uint8_t count = history ? state_.historyCount : state_.entryCount;
+  if (!count) return;
+  if (older) {
+    if (messageSelection_ + 1 < count) {
+      ++messageSelection_;
+      const String* ids = history ? state_.historyIds : state_.entryIds;
+      messageSelectionId_ = ids[messageSelection_];
+      state_.dirty = true;
+      return;
+    }
+    if (!history || state_.historyOffset + count < state_.historyTotal) {
+      const uint16_t next = history ? state_.historyOffset + 5 : 5;
+      JsonDocument document;
+      document["cmd"] = "msgs";
+      document["off"] = next;
+      String request;
+      serializeJson(document, request);
+      emit(request);
+      pendingHistorySelection_ = true;
+      pendingHistoryOffset_ = next;
+      pendingMessageSelection_ = 0;
+    }
+    return;
+  }
+
+  if (messageSelection_ > 0) {
+    --messageSelection_;
+    const String* ids = history ? state_.historyIds : state_.entryIds;
+    messageSelectionId_ = ids[messageSelection_];
+    state_.dirty = true;
+    return;
+  }
+  if (!history) return;
+  if (state_.historyOffset <= 5) {
+    state_.historyOffset = 0;
+    messageSelection_ = state_.entryCount ? state_.entryCount - 1 : 0;
+    messageSelectionId_ = state_.entryCount ? state_.entryIds[messageSelection_] : String("");
+    pendingHistorySelection_ = false;
+    state_.dirty = true;
+    return;
+  }
+  const uint16_t next = state_.historyOffset - 5;
+  JsonDocument document;
+  document["cmd"] = "msgs";
+  document["off"] = next;
+  String request;
+  serializeJson(document, request);
+  emit(request);
+  pendingHistorySelection_ = true;
+  pendingHistoryOffset_ = next;
+  pendingMessageSelection_ = 4;
+}
+
 void FamiliarUi::handleTap(int16_t x, int16_t y) {
   emit(String("{\"cmd\":\"touch\",\"x\":") + x + ",\"y\":" + y + "}");
   if (state_.toastUntilMs) { state_.toastUntilMs = 0; state_.toast = ""; }
   if (state_.modalActive) {
+    state_.messageDetailPending = false;
+    state_.messageDetailRequestedId = "";
     state_.modalActive = false;
     state_.modalBody = "";
     agentResponseModal_ = false;
     agentResponseModalTruncated_ = false;
+    messageDetailModal_ = false;
     state_.page = state_.modalReturn;
     state_.dirty = true;
     return;
@@ -755,6 +931,7 @@ void FamiliarUi::handleTap(int16_t x, int16_t y) {
         state_.modalActive = true;
         agentResponseModal_ = false;
         agentResponseModalTruncated_ = false;
+        messageDetailModal_ = false;
         modalScroll_ = 0;
       }
     } else {
@@ -780,10 +957,12 @@ void FamiliarUi::handleTap(int16_t x, int16_t y) {
   } else if (state_.page == protocol::Page::Messages) {
     const bool history = state_.historyOffset > 0 && state_.historyCount > 0;
     const uint8_t count = history ? state_.historyCount : state_.entryCount;
-    const int16_t rowHeight = messageRowHeight(count);
-    if (!history && state_.agentResponseMarkdown.length() && y >= 48 &&
-        y < 48 + rowHeight && x >= kContentX && x < kContentRight - kContentX)
-      openAgentResponseModal();
+    for (uint8_t card = 0; card < 2; ++card) {
+      if (!messageCardRect(card).contains(x, y)) continue;
+      const uint8_t index = static_cast<uint8_t>(messageSelection_ + card);
+      if (index < count) openMessage(index, history);
+      break;
+    }
   } else if (state_.page == protocol::Page::Fleet ||
              state_.page == protocol::Page::Cron ||
              state_.page == protocol::Page::Network) {
@@ -803,6 +982,7 @@ void FamiliarUi::handleTap(int16_t x, int16_t y) {
           modalScroll_ = 0;
           agentResponseModal_ = false;
           agentResponseModalTruncated_ = false;
+          messageDetailModal_ = false;
           opened = true;
           break;
         }
@@ -827,10 +1007,13 @@ void FamiliarUi::touchGesture(int16_t sx, int16_t sy, int16_t ex, int16_t ey,
     return;
   }
   if (state_.modalActive) {
+    state_.messageDetailPending = false;
+    state_.messageDetailRequestedId = "";
     state_.modalActive = false;
     state_.modalBody = "";
     agentResponseModal_ = false;
     agentResponseModalTruncated_ = false;
+    messageDetailModal_ = false;
     state_.page = state_.modalReturn;
     state_.dirty = true;
     return;
@@ -845,11 +1028,7 @@ void FamiliarUi::touchGesture(int16_t sx, int16_t sy, int16_t ex, int16_t ey,
     return;
   }
   if (vertical && !state_.modalActive && state_.page == protocol::Page::Messages) {
-    int next = static_cast<int>(state_.historyOffset) + (dy < 0 ? 5 : -5);
-    if (next <= 0) {
-      state_.historyOffset = 0;
-      state_.dirty = true;
-    } else emit(String("{\"cmd\":\"msgs\",\"off\":") + next + "}");
+    browseMessages(dy < 0);
     return;
   }
   if (durationMs < 1200 && abs(dx) < 24 && abs(dy) < 24) handleTap(sx, sy);

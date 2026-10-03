@@ -36,10 +36,20 @@ struct UiState {
   uint32_t tokensToday = 0, toolsToday = 0;
   String jobState = "idle", jobLabel = "Status brief", message = "Awaiting Hermes stream";
   String entries[5];
+  String entryIds[5];
   uint8_t entryCount = 0;
   String history[5];
+  String historyIds[5];
   uint8_t historyCount = 0;
   uint16_t historyOffset = 0, historyTotal = 0;
+  // A detail response is accepted only for the currently pending request while
+  // its modal is open. The UI owns request/close transitions.
+  String messageDetailRequestedId;
+  String messageDetailBody;
+  String messageDetailRole;
+  String messageDetailError;
+  bool messageDetailPending = false;
+  bool messageDetailTruncated = false;
   // Optional full Markdown response paired with the concise `message` preview.
   // The protocol parser bounds this to a complete UTF-8 prefix of the frame.
   String agentResponseMarkdown;

@@ -6,20 +6,22 @@
 namespace protocol {
 namespace {
 constexpr size_t kMaxAgentMarkdownBytes = 3072;
+constexpr size_t kMaxMessageIdBytes = 128;
+constexpr size_t kMaxMessageDetailBytes = 3200;
 
 String textOr(JsonVariantConst value, const char* fallback = "") {
   return value.is<const char*>() ? String(value.as<const char*>()) : String(fallback);
 }
 
-String boundedMarkdown(JsonVariantConst value, bool& truncated) {
+String boundedUtf8(JsonVariantConst value, size_t maxBytes, bool& truncated) {
   truncated = false;
   if (!value.is<const char*>()) return String();
   const char* raw = value.as<const char*>();
   if (!raw) return String();
   size_t length = strlen(raw);
-  if (length > kMaxAgentMarkdownBytes) {
+  if (length > maxBytes) {
     truncated = true;
-    length = kMaxAgentMarkdownBytes;
+    length = maxBytes;
     // Do not leave a UTF-8 continuation byte at the beginning of the removed
     // tail. JSON byte capacity is fixed, but text length is counted in bytes.
     while (length && (static_cast<uint8_t>(raw[length]) & 0xc0) == 0x80) --length;
@@ -28,6 +30,37 @@ String boundedMarkdown(JsonVariantConst value, bool& truncated) {
   result.reserve(length);
   for (size_t i = 0; i < length; ++i) result += raw[i];
   return result;
+}
+
+String messageId(JsonVariantConst value) {
+  if (!value.is<const char*>()) return String();
+  const char* raw = value.as<const char*>();
+  if (!raw || !raw[0] || strlen(raw) > kMaxMessageIdBytes) return String();
+  bool ignored = false;
+  return boundedUtf8(value, kMaxMessageIdBytes, ignored);
+}
+
+String boundedText(JsonVariantConst value, size_t maxBytes) {
+  bool ignored = false;
+  return boundedUtf8(value, maxBytes, ignored);
+}
+
+void readIds(JsonVariantConst field, String (&ids)[5], uint8_t count) {
+  for (String& id : ids) id = "";
+  if (!field.is<JsonArrayConst>()) return;
+  JsonArrayConst values = field.as<JsonArrayConst>();
+  for (uint8_t i = 0; i < count && i < 5 && i < values.size(); ++i) {
+    ids[i] = messageId(values[i]);
+  }
+}
+
+void clearMessageDetailRequest(UiState& s) {
+  s.messageDetailRequestedId = "";
+  s.messageDetailBody = "";
+  s.messageDetailRole = "";
+  s.messageDetailError = "";
+  s.messageDetailPending = false;
+  s.messageDetailTruncated = false;
 }
 
 void markLive(UiState& s, uint32_t nowMs) {
@@ -100,6 +133,28 @@ bool applyJsonFrame(UiState& s, const String& line, uint32_t nowMs) {
       if (s.historyCount == 5) break;
       s.history[s.historyCount++] = textOr(value);
     }
+    readIds(root["ids"], s.historyIds, s.historyCount);
+    markLive(s, nowMs);
+    return true;
+  }
+  if (!strcmp(type, "msg")) {
+    // Late replies from a prior selection, replies after close, and replies
+    // arriving after a newer request must not replace the visible detail.
+    if (!s.modalActive || !s.messageDetailPending || s.messageDetailRequestedId.isEmpty() ||
+        !root["id"].is<const char*>() ||
+        !root["id"].as<const char*>()[0] ||
+        strcmp(root["id"].as<const char*>(), s.messageDetailRequestedId.c_str())) return false;
+
+    const bool hasBody = root["body"].is<const char*>();
+    const bool hasError = root["error"].is<const char*>() && root["error"].as<const char*>()[0];
+    if (!hasBody && !hasError) return false;
+    bool locallyTruncated = false;
+    s.messageDetailBody = boundedUtf8(root["body"], kMaxMessageDetailBytes, locallyTruncated);
+    s.messageDetailRole = boundedText(root["role"], 32);
+    s.messageDetailError = hasError ? boundedText(root["error"], 160) : "";
+    s.messageDetailTruncated = locallyTruncated ||
+        (root["truncated"].is<bool>() && root["truncated"].as<bool>());
+    s.messageDetailPending = false;
     markLive(s, nowMs);
     return true;
   }
@@ -110,6 +165,7 @@ bool applyJsonFrame(UiState& s, const String& line, uint32_t nowMs) {
     for (uint8_t i = 0; i < 3; ++i) page.lines[i] = textOr(root["lines"][i]);
     page.set = true;
     if (slot == 9) {
+      clearMessageDetailRequest(s);
       if (!s.modalActive) s.modalReturn = s.page;
       s.modal = page;
       s.modalBody = "";
@@ -122,6 +178,7 @@ bool applyJsonFrame(UiState& s, const String& line, uint32_t nowMs) {
     return true;
   }
   if (!strcmp(type, "permission")) {
+    clearMessageDetailRequest(s);
     s.approval.active = true;
     s.approval.id = textOr(root["id"]);
     s.approval.text = textOr(root["text"], "Hermes needs approval");
@@ -159,13 +216,15 @@ bool applyJsonFrame(UiState& s, const String& line, uint32_t nowMs) {
   s.runningDeck = root["job_index"] | s.runningDeck;
   s.message = textOr(root["msg"], s.message.c_str());
   s.entryCount = 0;
+  for (String& id : s.entryIds) id = "";
   for (JsonVariantConst value : root["entries"].as<JsonArrayConst>()) {
     if (s.entryCount == 5) break;
     s.entries[s.entryCount++] = textOr(value);
   }
+  readIds(root["entry_ids"], s.entryIds, s.entryCount);
   if (root["msg_markdown"].is<const char*>()) {
     bool locallyTruncated = false;
-    s.agentResponseMarkdown = boundedMarkdown(root["msg_markdown"], locallyTruncated);
+    s.agentResponseMarkdown = boundedUtf8(root["msg_markdown"], kMaxAgentMarkdownBytes, locallyTruncated);
     s.agentResponseMarkdownTruncated =
         locallyTruncated || (root["msg_markdown_truncated"] | false);
   }
