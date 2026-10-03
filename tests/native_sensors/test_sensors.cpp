@@ -14,6 +14,15 @@ void setValidRtc(TwoWire& bus) {
   for (size_t i = 1; i < sizeof(registers); ++i) bus.set(kRtc, registers[0] + i - 1, registers[i]);
 }
 
+void setAccel(TwoWire& bus, int16_t x, int16_t y, int16_t z) {
+  const int16_t values[] = {x, y, z};
+  for (size_t axis = 0; axis < 3; ++axis) {
+    const uint16_t raw = static_cast<uint16_t>(values[axis]);
+    bus.set(kQmi, static_cast<uint8_t>(0x35 + axis * 2), static_cast<uint8_t>(raw));
+    bus.set(kQmi, static_cast<uint8_t>(0x36 + axis * 2), static_cast<uint8_t>(raw >> 8));
+  }
+}
+
 void testBootReadsWithoutSettingRtc() {
   TwoWire bus;
   setValidRtc(bus);
@@ -193,6 +202,109 @@ void testImuSamplingRestoresReadyAfterTransientReadError() {
   assert(sensors.snapshot().imuReady && sensors.snapshot().accelerationReady);
   assert(sensors.snapshot().imuErrors == 1);
 }
+
+void testLearnedOrientationGesturesAndShake() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  for (uint32_t now = 300; now <= 3000; now += 300) sensors.update(now);
+
+  setAccel(bus, 0, 0, -8192);
+  for (uint32_t now = 3300; now <= 4500; now += 300) sensors.update(now);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
+  const uint32_t faceDownSequence = sensors.snapshot().gestureSequence;
+  assert(faceDownSequence == 1);
+
+  setAccel(bus, 0, 0, 8192);
+  for (uint32_t now = 4800; now <= 5400; now += 300) sensors.update(now);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Upright);
+  assert(sensors.snapshot().gestureSequence == faceDownSequence + 1);
+
+  setAccel(bus, 0, 0, 16384);
+  sensors.update(5700);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Shake);
+  assert(sensors.snapshot().gestureSequence == faceDownSequence + 2);
+
+  setAccel(bus, 0, 0, 8192);
+  sensors.update(6000);
+  setAccel(bus, 0, 0, 10240);
+  sensors.update(8100);
+  setAccel(bus, 0, 0, 8192);
+  sensors.update(8400);
+  assert(sensors.snapshot().gesture != peripherals::Gesture::Tap2);  // One knock plus its return edge.
+  setAccel(bus, 0, 0, 10240);
+  sensors.update(8700);
+  setAccel(bus, 0, 0, 8192);
+  sensors.update(9000);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Tap2);
+  assert(sensors.snapshot().gestureSequence == faceDownSequence + 3);
+}
+
+void testImuOutageCancelsTapAndReanchorsMotion() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  for (uint32_t now = 300; now <= 3000; now += 300) sensors.update(now);
+  setAccel(bus, 0, 0, 10240);
+  sensors.update(3300);  // First half of a real tap pair.
+  bus.failTransaction = bus.transactionCount + 3;  // RTC control and calendar reads precede the IMU burst.
+  sensors.update(3600);  // Drop the IMU burst.
+  assert(!sensors.snapshot().accelerationReady);
+  setAccel(bus, 0, 0, 16384);
+  sensors.update(3900);  // Discontinuous post-outage sample is only an anchor.
+  assert(sensors.snapshot().gesture == peripherals::Gesture::None);
+  sensors.update(4200);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::None);
+}
+
+void testPickupCanFollowTwoMinutesOfStillnessFromBoot() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  for (uint32_t now = 300; now <= 3000; now += 300) sensors.update(now);
+  sensors.update(120000);
+  setAccel(bus, 0, 0, 10650);
+  sensors.update(120300);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Pickup);
+}
+
+void testImuOutagePreservesLearnedOrientationAndQuietRecovery() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  for (uint32_t now = 300; now <= 3000; now += 300) sensors.update(now);
+
+  setAccel(bus, 0, 0, -8192);
+  for (uint32_t now = 3300; now <= 4500; now += 300) sensors.update(now);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
+
+  bus.failTransaction = bus.transactionCount + 3;  // RTC control/calendar reads precede the IMU burst.
+  sensors.update(4800);
+  assert(!sensors.snapshot().accelerationReady);
+  sensors.update(5100);  // First recovered sample reanchors magnitude only.
+  for (uint32_t now = 5400; now <= 6600; now += 300) sensors.update(now);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
+
+  setAccel(bus, 0, 0, 8192);
+  for (uint32_t now = 6900; now <= 7500; now += 300) sensors.update(now);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Upright);
+}
 }  // namespace
 
 int main() {
@@ -207,5 +319,9 @@ int main() {
   testRestartReadbackFailureRestoresOriginalStoppedControl();
   testShortRtcControlWriteIsReportedAsFailure();
   testImuSamplingRestoresReadyAfterTransientReadError();
+  testLearnedOrientationGesturesAndShake();
+  testImuOutageCancelsTapAndReanchorsMotion();
+  testPickupCanFollowTwoMinutesOfStillnessFromBoot();
+  testImuOutagePreservesLearnedOrientationAndQuietRecovery();
   std::cout << "native sensor tests passed\n";
 }

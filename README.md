@@ -43,6 +43,19 @@ A physical Hermes Agent familiar: green-phosphor portrait, SD-card animations, t
 pio run
 ```
 
+Prepare a local release bundle for the 3.49 V1 board after building its image:
+
+```bash
+pio run -e waveshare_esp32_s3_touch_lcd_349_v1
+python3 scripts/package_v1_release.py
+```
+
+The ignored `dist/waveshare-349-v1/` directory contains the V1-specific firmware
+artifacts, a regenerated SD-card pack, source/toolchain metadata, and SHA-256
+checksums. The pack is explicitly separate from the original 2.8-inch profile;
+see [`docs/RELEASE_349_V1.md`](docs/RELEASE_349_V1.md) for its contents and the
+board-specific upload notes.
+
 ## Flash
 
 ```bash
@@ -98,6 +111,10 @@ What the device shows/does in plugin mode:
 - **Message ticker** — your messages (`u:`) and Hermes replies (`a:`) land on
   Page 1 as they happen; every reply also toasts a gold `> HERMES:` banner in
   the bottom band for 4s on whatever page you're on.
+- **Latest response viewer (3.49 V1 firmware)** — tap the latest response on
+  Page 0 or the newest entry on Page 1 to open its Markdown-formatted text;
+  swipe vertically to read longer responses and tap to return. Long responses
+  may be shortened to fit the device protocol limit.
 - **`familiar_notify` agent tool** — Hermes itself can ping the desk: banner
   + chirp. "Ping my desk when the build finishes" now works, and cron jobs
   can reach the device the same way.
@@ -117,6 +134,32 @@ What the device shows/does in plugin mode:
 
 See [`docs/HERMES_INTEGRATION.md`](docs/HERMES_INTEGRATION.md) for the full
 contract.
+
+### Voice and TTS providers
+
+Voice is enabled by default and uses the Hermes gateway's configured TTS
+provider. Configure the optional renderer in
+`~/.hermes/familiar_actions.json` under `voice`:
+
+```json
+{
+  "voice": {
+    "enabled": true,
+    "provider": "vertex-gemini",
+    "model": "gemini-2.5-flash-tts",
+    "voice": "Kore"
+  }
+}
+```
+
+Supported providers are `hermes` (default), `vertex-gemini` and `yandex`.
+Gemini also accepts `gemini` as an alias; Yandex accepts `yandex-speechkit`.
+For Vertex Express Mode Gemini TTS, set `G_API_KEY` in the environment used by
+the Hermes gateway. For Yandex SpeechKit, set `YANDEX_AI_API_KEY`; its default
+voice and language are `filipp` and `ru-RU`. Yandex configuration can specify
+`"voice": "filipp"` and `"language": "ru-RU"`. Do not put API keys in the
+JSON config. Provider API access and device playback require network access
+from the gateway host and a reachable advertised host address for the device.
 
 ### Network transports (TCP + WebSocket)
 

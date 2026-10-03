@@ -3,3 +3,6 @@ __pycache__/
 ios/PocketFamiliar/build/
 ios/PocketFamiliar/*.xcodeproj/
 .pio/
+.env
+tts_check.wav
+/dist/

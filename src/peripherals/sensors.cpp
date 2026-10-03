@@ -1,6 +1,7 @@
 #include "sensors.h"
 
 #include <cstring>
+#include <cmath>
 
 namespace peripherals {
 namespace {
@@ -88,6 +89,8 @@ bool Sensors::begin(TwoWire& peripheralBus, uint32_t nowMs) {
   lastRtcMs_ = nowMs - kRtcIntervalMs;
   lastImuMs_ = nowMs - kImuIntervalMs;
   lastImuRecoveryMs_ = nowMs;
+  imuStartedMs_ = nowMs;
+  lastMotionMs_ = nowMs;
   update(nowMs);
   return state_.rtcReady || state_.imuReady;
 }
@@ -346,6 +349,15 @@ void Sensors::sampleImu(uint32_t nowMs) {
   if (!readRegisters(activeImuAddress_, 0x35, raw, sizeof(raw))) {
     state_.accelerationReady = false;
     state_.imuReady = false;
+    // Never complete a tap pair or attitude transition across missing data.
+    previousTapPulseMs_ = 0;
+    tapArmed_ = true;
+    haveLastAccelerationMagnitude_ = false;
+    lastMotionMs_ = nowMs;
+    // Keep a previously learned resting attitude through a transient outage.
+    // If still learning, discard only that incomplete qualification run.
+    if (!baseSet_) basePolls_ = 0;
+    faceDownPolls_ = uprightPolls_ = 0;
     if (consecutiveImuErrors_ != UINT8_MAX) ++consecutiveImuErrors_;
     incrementSaturated(state_.imuErrors);
     return;
@@ -360,8 +372,90 @@ void Sensors::sampleImu(uint32_t nowMs) {
   state_.accelerationZG = static_cast<float>(az) / 8192.0f;
   state_.accelerationReady = true;
   state_.imuReady = true;
+  detectGesture(nowMs);
+}
 
-  (void)nowMs;
+void Sensors::emitGesture(Gesture gesture) {
+  state_.gesture = gesture;
+  ++state_.gestureSequence;
+}
+
+void Sensors::detectGesture(uint32_t nowMs) {
+  const float x = state_.accelerationXG;
+  const float y = state_.accelerationYG;
+  const float z = state_.accelerationZG;
+  const float magnitude = std::sqrt(x * x + y * y + z * z);
+  if (!haveLastAccelerationMagnitude_) {
+    lastAccelerationMagnitude_ = magnitude;
+    haveLastAccelerationMagnitude_ = true;
+    return;  // Re-anchor after an outage; never interpret the jump as motion.
+  }
+  const float delta = std::fabs(magnitude - lastAccelerationMagnitude_);
+  const uint32_t previousMotionMs = lastMotionMs_;
+  if (delta > 0.10f) lastMotionMs_ = nowMs;
+
+  if (!baseSet_) {
+    if (delta < 0.10f && magnitude > 0.5f) {
+      if (++basePolls_ >= 10) {
+        baseX_ = x; baseY_ = y; baseZ_ = z;
+        baseSet_ = true;
+      }
+    } else {
+      basePolls_ = 0;
+    }
+    if (!baseSet_ && nowMs - imuStartedMs_ > 60000 && magnitude > 0.5f) {
+      baseX_ = x; baseY_ = y; baseZ_ = z;
+      baseSet_ = true;
+    }
+  }
+
+  float dot = 1.0f;
+  if (baseSet_) {
+    const float baseMagnitude = std::sqrt(baseX_ * baseX_ + baseY_ * baseY_ + baseZ_ * baseZ_);
+    if (baseMagnitude > 0.15f && magnitude > 0.15f)
+      dot = (x * baseX_ + y * baseY_ + z * baseZ_) / (baseMagnitude * magnitude);
+  }
+  if (dot < -0.35f) { uprightPolls_ = 0; if (faceDownPolls_ < 250) ++faceDownPolls_; }
+  else if (dot > 0.2f) { faceDownPolls_ = 0; if (uprightPolls_ < 250) ++uprightPolls_; }
+  else { faceDownPolls_ = 0; uprightPolls_ = 0; }
+  if (!quietMode_ && faceDownPolls_ == 5) {
+    quietMode_ = true;
+    emitGesture(Gesture::FaceDown);
+  } else if (quietMode_ && uprightPolls_ == 3) {
+    quietMode_ = false;
+    emitGesture(Gesture::Upright);
+  }
+
+  const float baseMagnitude = std::sqrt(baseX_ * baseX_ + baseY_ * baseY_ + baseZ_ * baseZ_);
+  const bool neutral = baseSet_ && std::fabs(magnitude - baseMagnitude) < 0.10f;
+  if (neutral) tapArmed_ = true;
+
+  if (delta > 0.65f && nowMs - lastShakeMs_ > 1800) {
+    lastShakeMs_ = nowMs;
+    emitGesture(Gesture::Shake);
+  } else if (!quietMode_ && !neutral && delta > 0.22f && delta <= 0.65f &&
+             nowMs - lastShakeMs_ > 1800) {
+    // Count one excursion from rest; returning to the learned magnitude rearms
+    // the detector but cannot be mistaken for the second knock.
+    if (tapArmed_) {
+      tapArmed_ = false;
+      if (previousTapPulseMs_ && nowMs - previousTapPulseMs_ >= 150 &&
+          nowMs - previousTapPulseMs_ <= 1200) {
+        previousTapPulseMs_ = 0;
+        emitGesture(Gesture::Tap2);
+      } else {
+        previousTapPulseMs_ = nowMs;
+      }
+    }
+  }
+  if (previousTapPulseMs_ && nowMs - previousTapPulseMs_ > 1200)
+    previousTapPulseMs_ = 0;
+
+  if (delta > 0.18f && !quietMode_ &&
+      nowMs - previousMotionMs > 120000 && nowMs - lastShakeMs_ > 1800) {
+    emitGesture(Gesture::Pickup);
+  }
+  lastAccelerationMagnitude_ = magnitude;
 }
 
 void Sensors::update(uint32_t nowMs) {

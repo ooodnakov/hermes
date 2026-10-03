@@ -40,6 +40,10 @@ struct UiState {
   String history[5];
   uint8_t historyCount = 0;
   uint16_t historyOffset = 0, historyTotal = 0;
+  // Optional full Markdown response paired with the concise `message` preview.
+  // The protocol parser bounds this to a complete UTF-8 prefix of the frame.
+  String agentResponseMarkdown;
+  bool agentResponseMarkdownTruncated = false;
   DeckAction deck[6];
   uint8_t deckCount = 0;
   int8_t armedDeck = -1, runningDeck = -1;

@@ -4,6 +4,7 @@
 #include <LovyanGFX.hpp>
 
 #include "../protocol/ui_state.h"
+#include "markdown.h"
 
 namespace ui {
 
@@ -48,6 +49,11 @@ class FamiliarUi {
   void* faceContext_ = nullptr;
   uint32_t nowMs_ = 0;
   uint16_t modalScroll_ = 0;
+  bool agentResponseModal_ = false;
+  uint32_t parsedResponseHash_ = 0;
+  bool responseParseReady_ = false;
+  bool agentResponseModalTruncated_ = false;
+  markdown::Document responseDocument_;
 
   void emit(const String& json);
   void drawTabs(uint16_t accent);
@@ -57,12 +63,21 @@ class FamiliarUi {
   void drawOperations();
   void drawHostPage(const protocol::HostPage& page, const char* fallback);
   void drawModal();
+  void drawMarkdownResponse();
+  void ensureResponseParsed();
+  void drawText(const String& text, int16_t x, int16_t y, int16_t width,
+                uint16_t color, float size = 1.0f, bool ellipsis = true,
+                uint16_t background = 0x0000);
+  void drawCenteredText(const String& text, const Rect& rect, uint16_t color,
+                        float size = 1.0f, uint16_t background = 0x0000);
   void drawWrapped(const String& text, int16_t x, int16_t y, int16_t width,
-                   int16_t height, uint16_t color, uint8_t scale = 1,
+                   int16_t height, uint16_t color, float scale = 1.0f,
                    uint16_t skipLines = 0);
   void selectPage(uint8_t index);
   void handleTap(int16_t x, int16_t y);
   void decideApproval(const char* decision);
+  void openAgentResponseModal();
+  const String& modalContent() const;
 };
 
 }  // namespace ui

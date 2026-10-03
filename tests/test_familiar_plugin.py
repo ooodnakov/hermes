@@ -71,6 +71,8 @@ def wired(monkeypatch, tmp_path):
     familiar._turns.clear()
     familiar._pending.clear()
     familiar._entries.clear()
+    monkeypatch.setattr(familiar, "_agent_response_markdown", "")
+    monkeypatch.setattr(familiar, "_agent_response_markdown_truncated", False)
     familiar._presence.update({"desk": 0.0, "phone": 0.0})
     familiar._telemetry.clear()
     monkeypatch.setattr(familiar, "_desk_quiet", False)
@@ -88,6 +90,38 @@ def test_register_wires_hooks_and_command(wired):
     assert familiar._link is not None  # fake injected; real link is gateway-only
 
 
+def test_register_forwards_explicit_voice_provider_options(monkeypatch):
+    ctx = FakeCtx()
+    calls = []
+    monkeypatch.setattr(familiar, "_voice_cfg", {})
+    monkeypatch.setattr(familiar._actions, "load_config", lambda: {
+        "voice": {"provider": "vertex-gemini", "model": "gemini-2.5-flash-tts", "voice": "Kore"}
+    })
+    monkeypatch.setattr(familiar._voice, "configure_provider",
+                        lambda provider, **options: calls.append((provider, options)))
+
+    familiar.register(ctx)
+
+    assert calls == [("vertex-gemini", {
+        "model": "gemini-2.5-flash-tts", "voice": "Kore", "language": None
+    })]
+
+
+def test_register_forwards_yandex_voice_and_language_options(monkeypatch):
+    ctx = FakeCtx()
+    calls = []
+    monkeypatch.setattr(familiar, "_voice_cfg", {})
+    monkeypatch.setattr(familiar._actions, "load_config", lambda: {
+        "voice": {"provider": "yandex", "voice": "jane", "language": "en-US"}
+    })
+    monkeypatch.setattr(familiar._voice, "configure_provider",
+                        lambda provider, **options: calls.append((provider, options)))
+
+    familiar.register(ctx)
+
+    assert calls == [("yandex", {"model": None, "voice": "jane", "language": "en-US"})]
+
+
 def test_turn_lifecycle_drives_running_flag(wired):
     ctx, link = wired
     ctx.hooks["pre_llm_call"](platform="telegram", session_id="s1")
@@ -103,6 +137,63 @@ def test_turn_lifecycle_drives_running_flag(wired):
     assert last["running"] == 0
     assert any("All done" in e for e in last["entries"])
     assert link.frames("event")[-1]["event"] == "message"
+
+
+def test_agent_reply_keeps_raw_markdown_separate_from_compact_preview(wired):
+    ctx, link = wired
+    raw = "## Привет\n\n**Жирный ответ** и [ссылка](https://example.test)\n\n```python\nprint('да')\n```"
+
+    ctx.hooks["post_llm_call"](assistant_response=raw, platform="telegram", session_id="md-1")
+
+    state = link.frames("state")[-1]
+    assert state["msg_markdown"] == raw
+    assert state["msg_markdown_truncated"] is False
+    assert "\n" not in state["msg"]
+    assert "## Привет" in state["msg"]
+    assert familiar._wire_json_size(state) <= familiar._MAX_DEVICE_JSON_BYTES
+
+
+def test_blank_new_response_clears_previous_latest_markdown(wired):
+    ctx, link = wired
+    ctx.hooks["post_llm_call"](assistant_response="**previous reply**", session_id="md-old")
+    ctx.hooks["post_llm_call"](assistant_response="\n \t", session_id="md-empty")
+
+    state = link.frames("state")[-1]
+    assert state["msg_markdown"] == ""
+    assert state["msg_markdown_truncated"] is False
+    assert state["msg"] == "No text response"
+
+
+def test_cyrillic_markdown_is_clipped_to_a_complete_utf8_prefix_and_wire_budget(wired):
+    ctx, link = wired
+    raw = ("### Заголовок\n\nТекст **важно** 🙂 и [ссылка](https://example.test/a?x=1&y=2)\n\n" * 500)
+
+    ctx.hooks["post_llm_call"](assistant_response=raw, platform="gateway", session_id="md-large")
+
+    state = link.frames("state")[-1]
+    markdown = state["msg_markdown"]
+    assert state["msg_markdown_truncated"] is True
+    assert markdown.endswith("\n\n[Response clipped]")
+    assert len(markdown.encode("utf-8")) <= familiar._MAX_AGENT_MARKDOWN_BYTES
+    assert familiar._wire_json_size(state) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert markdown.encode("utf-8").decode("utf-8") == markdown
+
+
+def test_markdown_budget_fallback_never_exceeds_device_line_limit():
+    base = {
+        "type": "state",
+        "total": 1,
+        "running": 0,
+        "waiting": 0,
+        "msg": "compact preview",
+        "job_label": "Ж" * 3000,
+        "entries": ["старый текст" * 300],
+    }
+    frame = familiar._fit_markdown_state_frame(base, "**response**", False)
+    assert familiar._wire_json_size(frame) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert frame["msg_markdown"] == ""
+    assert frame["msg_markdown_truncated"] is True
+    assert frame["type"] == "state"
 
 
 def test_approval_flow_pushes_permission_and_resolves(wired, monkeypatch):
@@ -129,6 +220,24 @@ def test_device_permission_with_no_pending_is_acked(wired):
     _, link = wired
     familiar._handle_device_line({"cmd": "permission", "decision": "once"})
     assert link.sent[-2]["msg"] == "no pending approval"
+
+
+def test_device_permission_with_stale_id_does_not_resolve_another_approval(wired, monkeypatch):
+    ctx, link = wired
+    ctx.hooks["pre_approval_request"](command="deploy production",
+                                      description="Production deploy",
+                                      session_key="current-approval", surface="gateway")
+    calls = []
+    monkeypatch.setattr(actions, "_resolve_approval",
+                        lambda key, choice: calls.append((key, choice)) or 1)
+
+    familiar._handle_device_line({"cmd": "permission", "decision": "once", "id": "stale-approval"})
+
+    assert calls == []
+    assert familiar._pending == {"current-approval": "Production deploy"}
+    assert link.sent[-2]["type"] == "ack"
+    assert link.sent[-2]["msg"] == "stale approval id"
+    assert link.sent[-2]["waiting"] == 1
 
 
 def test_deck_frame_shapes_buttons():

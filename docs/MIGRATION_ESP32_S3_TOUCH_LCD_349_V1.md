@@ -176,6 +176,20 @@ Completion: a clean checkout can reproduce the firmware and artwork, all require
 
 **Dependencies and useful checkpoints**
 
+**Status/readability continuation (2026-10-03)**
+
+- T16/T17/T30: UI time is captured after TCP dispatch to avoid unsigned host-age underflow and one-frame IDLE/ONLINE flicker. The existing 30-second approval/liveness expiry is unchanged. Local diagnostic commands no longer suppress the TCP host. The flashed candidate passed a 65-second idle capture with 33 TCP state frames, zero rendered liveness changes/offline frames after connection, and zero disconnects.
+- T16/T17/T34: all seven tabs now use the built-in Unicode font, measured UTF-8 wrapping/truncation, larger text, brighter secondary labels, and explicit text bounds/backgrounds. Native recording tests cover populated page content, Cyrillic, command punctuation, and exact expiry/wraparound. Physical visual signoff remains separate.
+- T35: all three environments build with the known nonfatal size-helper warning. Current V1 uses 66,976 bytes RAM and 1,872,211 bytes flash; its verified upload checksum is recorded in the handoff. The original physical audio/gesture and sustained/failure checks remain open.
+
+**Audio/network/gesture continuation (2026-09-30)**
+
+- T23/T34 now include software gesture detection and native regressions for separate double-tap pulses, pickup stillness, missing-data cancellation, and face-down recovery followed by upright/unmute. The read-only physical capture tool and procedure are in `scripts/check_v1_gestures.py` and `docs/V1_PHYSICAL_CHECKS.md`. Physical calibration remains pending until events are observed on the board.
+- T24/T25 now include bounded asynchronous HTTP PCM playback, fragmented PCM16LE decoding, shared peripheral-bus locking, cleanup retries, and speech diagnostics. Both host speech URL conventions and embedded notification speech are supported. HTTP raw PCM is supported; encoded/chunked responses and unverified HTTPS are rejected. Conservative gain is unchanged; playback audibility remains a separate physical check.
+- T21/T29/T30 now include preserved nested configuration updates, V1 Wi-Fi/TCP dial-home, first-frame authentication, USB priority, reconnect framing reset, bounded input, and an output queue flushed through nonblocking socket sends. Numeric IPv4 hosts avoid synchronous DNS lookup on the UI loop. BLE remains unsupported, and T36 latency/workload targets remain unmeasured.
+- T28/T33 advanced through activation of Familiar in the user's existing LAN gateway and workstation-to-gateway authentication/deck/state checks. TCP/audio firewall rules are limited to the LAN. Real board-to-gateway evidence is recorded in the handoff, separately from workstation connectivity; no approval was exercised by these checks.
+- T34/T35: full host suite passes 62 tests; all three firmware environments build, with final V1 RAM/flash usage of 66,928 / 327,680 and 1,557,407 / 13,631,488 bytes. The known nonfatal size-helper warning remains. Clean-checkout/CI validation is still pending. The final build checksum and subsequent physical evidence are in the handoff. Credentials and machine-specific configuration remain outside Git.
+
 ```mermaid
 flowchart TD
     A[T01–T04: baseline and board identity] --> B[T05–T08: toolchain, power, buses]
@@ -222,3 +236,21 @@ Add native firmware test commands once T34 defines the meaningful host-testable 
 - WSL-to-LAN routing usable by the ESP32: T28.
 
 Context7 was attempted for current framework documentation but returned a transport error. This plan therefore uses the inspected repository code, the pinned Waveshare examples, and the linked primary documentation. Hardware values and proposed rendering choices still require the explicit bring-up checks above.
+
+**Markdown viewer and voice-provider continuation (2026-10-03)**
+
+- The user chose to verify and finish current working-tree changes. Final host validation passed 86 tests and 13 pytest subtests; all three firmware environments passed. After removing generated build artifacts, the V1 environment built successfully in 29.98 seconds with 67,080 bytes RAM and 2,873,739 bytes flash. This was a cleaned build in the existing checkout, not a clean-checkout or CI run. Bash syntax and `git diff --check` passed.
+- The current build was not uploaded; its artifact SHA-256 is `84b24c20c1edbd93bf2e16c09c154dae78bf19140dc9619e0f9c792bb125f365`, while the flashed firmware SHA remains the earlier checksum in the handoff. The 3.49 V1 Markdown response viewer and optional `vertex-gemini` / `yandex` Familiar TTS paths have software coverage. Review fixed Gemini MIME/rate/channel/codec checks, Yandex audio format validation, and smoke-script HTTP/PCM/argument/key/audio-extraction/temp-file handling, with regressions in the passing host suite. No live TTS API request, physical speech playback, or firmware upload was performed. The 2.8-inch firmware does not include the Markdown response viewer.
+
+**CI and firmware artifacts (2026-10-03)**
+
+- `.github/workflows/firmware-ci.yml` installs PlatformIO Core 6.2.0 and the host test dependencies, builds all three PlatformIO environments, then runs `python -m pytest tests/ -q`. The V1 familiar build runs before host tests so `tests/native_protocol` can use its ArduinoJson headers. CI packages the application `firmware.bin` for each environment separately as `firmware-349-v1`, `firmware-349-v1-diagnostic`, and `firmware-legacy-28`; each package includes a SHA-256 file and build/package version metadata. These are application images, not complete factory flash bundles, and workflow artifacts are not site-published.
+- The legacy environment's currently resolved libraries are now pinned to LovyanGFX 1.2.30, NimBLE-Arduino 2.5.1, and ArduinoJson 7.4.3. Those exact resolutions compiled successfully in this checkout alongside both V1 environments. A GitHub Actions run is still required to verify the clean-checkout workflow; T35/T38 remain partial until then.
+
+**Final V1 text and release artifacts (2026-10-03)**
+
+- The user confirmed the STATS popup spacing fix. The final image was flashed and esptool verified SHA-256 `af0eebadd45c6f4b65b0b01a4ab7a68266cf82e2c83d4c3bf9c00c19c4dd3015` (44.15 seconds); its application binary is 2,874,384 bytes. The V1 size report is 67,080 / 327,680 bytes RAM and 2,873,979 / 13,631,488 bytes flash. The previously flashed image `84b24c20c1edbd93bf2e16c09c154dae78bf19140dc9619e0f9c792bb125f365` remains a separate, earlier milestone.
+- All three PlatformIO environments built from a clean source snapshot with pinned libraries. A 65-second passive V1 capture recorded 63 diagnostic samples, 53 steady samples, 26 additional TCP states, no live/offline transitions or disconnects, maximum host age 1,755 ms, heap minimum/final 200,676 / 200,724 bytes, SD/Wi-Fi/TCP/audio ready, and RTC invalid. This does not complete gesture, battery calibration, or speech audibility checks.
+- On the earlier flashed image (`84b24c20c1edbd93bf2e16c09c154dae78bf19140dc9619e0f9c792bb125f365`), USB fault recovery rejected oversized and NUL-containing frames, then accepted subsequent valid traffic. Invalid HTTPS speech URLs and a refused loopback HTTP request did not reset the display or SD subsystem. These checks predate the final stats reflash. No live provider call or audible speech was verified.
+- T38 has a reproducible local packaging path in `scripts/package_v1_release.py` and [RELEASE_349_V1.md](RELEASE_349_V1.md). The bundle records commit/dirty counts, exact PlatformIO package versions, per-file hashes, V1 asset metadata, and the verified upload offsets. It includes the final app, bootloader, partition table, 8 KiB `boot_app0.bin`, and a regenerated 20-frame SD pack. Direct standalone flashing remains unexercised; the documented upload route is the V1 PlatformIO source target. The 2.8-inch output remains separately named and excluded from this bundle.
+- Final host validation passed 90 tests and 13 pytest subtests, including four packaging checks; all three environments also built from the clean source snapshot. Read-only gesture capture observed face-down quiet-on and upright quiet-off states; double-tap remains under observation and is not signed off. T38's local packaging and README/pin-map notes are present; clean-checkout CI, direct package flashing, publishing, and remaining broader release documentation are still separate work.

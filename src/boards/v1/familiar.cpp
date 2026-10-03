@@ -3,8 +3,12 @@
 #include "../../audio/v1_es8311.h"
 #include "../../display/axs15231b_display.h"
 #include "../../input/axs15231b_touch.h"
+#include "../../network/v1_network.h"
+#include "../../network/transport_policy.h"
 #include "../../peripherals/sensors.h"
+#include "../../peripherals/bus_lock.h"
 #include "../../protocol/serial_line_framer.h"
+#include "../../protocol/speech_dispatch.h"
 #include "../../protocol/ui_state.h"
 #include "../../storage/v1_assets.h"
 #include "../../ui/familiar_ui.h"
@@ -30,8 +34,12 @@ display::Axs15231bDisplay lcd;
 input::Axs15231bTouch touch(Wire);
 LGFX_Sprite canvas;
 protocol::UiState state;
+network::V1Network networkService;
+uint32_t usbLastInputAt = 0;
+bool processingUsbLine = false;
 ui::FamiliarUi familiarUi(canvas, state, [](void*, const String& line) {
   Serial.println(line);
+  networkService.sendLine(line.c_str(), usbLastInputAt && millis() - usbLastInputAt < 30000);
 });
 storage::V1Assets assets;
 peripherals::Sensors sensors;
@@ -47,6 +55,21 @@ uint32_t lastRenderAt = 0;
 uint32_t lastTelemetryAt = 0;
 uint32_t hostLastInputAt = 0;
 uint32_t powerPressedAt = 0;
+uint32_t acceptedProtocolFrames = 0;
+uint32_t acceptedUsbFrames = 0;
+uint32_t acceptedTcpFrames = 0;
+uint32_t acceptedStateFrames = 0;
+uint32_t acceptedUsbStateFrames = 0;
+uint32_t acceptedTcpStateFrames = 0;
+uint32_t lastStateFrameAt = 0;
+uint32_t lastUsbStateFrameAt = 0;
+uint32_t lastTcpStateFrameAt = 0;
+uint32_t faceRenderCount = 0;
+uint32_t faceOfflineRenderCount = 0;
+uint32_t faceLiveTransitionCount = 0;
+uint32_t lastFaceRenderAt = 0;
+bool hasRenderedFace = false;
+bool lastRenderedFaceLive = false;
 bool powerWasPressed = false;
 bool powerLongReported = false;
 bool displayReady = false;
@@ -58,6 +81,8 @@ int16_t touchStartX = 0, touchStartY = 0, touchLastX = 0, touchLastY = 0;
 uint32_t touchStartedAt = 0;
 uint32_t lastStatusUpdateAt = 0;
 uint32_t touchGestureCount = 0;
+uint32_t lastGestureSequence = 0;
+bool quietMode = false;
 
 bool readExpander(uint8_t reg, uint8_t& value) {
   Wire1.beginTransmission(board::kExpanderAddress);
@@ -76,6 +101,8 @@ bool writeExpander(uint8_t reg, uint8_t value) {
 }
 
 bool setSystemHold(bool enabled) {
+  peripherals::Wire1Lock lock;
+  if (!lock) return false;
   uint8_t output = 0, config = 0;
   if (!readExpander(0x01, output) || !readExpander(0x03, config)) return false;
   output = enabled ? static_cast<uint8_t>(output | kHoldBit)
@@ -88,8 +115,13 @@ bool setSystemHold(bool enabled) {
 }
 
 void sendJson(JsonDocument& document) {
-  serializeJson(document, Serial);
+  char line[4096];
+  if (measureJson(document) > sizeof(line) - 1) return;
+  const size_t length = serializeJson(document, line, sizeof(line));
+  if (length == 0 || length >= sizeof(line)) return;
+  Serial.write(reinterpret_cast<const uint8_t*>(line), length);
   Serial.write('\n');
+  networkService.sendLine(line, usbLastInputAt && millis() - usbLastInputAt < 30000);
 }
 
 void sendHello(const char* transport) {
@@ -187,9 +219,54 @@ void sendDiagnostic() {
   audioStats["last_test_gain_requested"] = audioDiag.lastTestGainRequested;
   audioStats["last_test_gain_readback"] = audioDiag.lastTestGainReadback;
   audioStats["baseline_restored"] = audioDiag.baselineRestored;
-  diagnostic["wifi"] = "unsupported";
+  audioStats["speech_requests"] = audioDiag.speechRequests;
+  audioStats["speech_successes"] = audioDiag.speechSuccesses;
+  audioStats["speech_failures"] = audioDiag.speechFailures;
+  audioStats["speech_skips"] = audioDiag.speechSkips;
+  audioStats["speech_bytes_received"] = audioDiag.speechBytesReceived;
+  audioStats["last_speech_bytes"] = audioDiag.lastSpeechBytes;
+  audioStats["http_status"] = audioDiag.lastHttpStatus;
+  diagnostic["wifi"] = networkService.wifiStatus();
+  diagnostic["wifi_configured"] = networkService.wifiConfigured();
+  diagnostic["wifi_ready"] = networkService.wifiReady();
+  if (networkService.wifiReady()) diagnostic["wifi_ip"] = networkService.localIp().toString();
   diagnostic["ble"] = "unsupported";
-  diagnostic["network"] = "unsupported";
+  diagnostic["network"] = networkService.tcpStatus();
+  diagnostic["tcp_ready"] = networkService.tcpConnected();
+  diagnostic["tcp_connects"] = networkService.tcpConnects();
+  diagnostic["tcp_disconnects"] = networkService.tcpDisconnects();
+  diagnostic["tcp_framing_errors"] = networkService.framingErrors();
+  diagnostic["tcp_configured"] = networkService.tcpConfigured();
+  if (networkService.tcpConfigured()) {
+    diagnostic["tcp_host"] = networkService.tcpHost();
+    diagnostic["tcp_port"] = networkService.tcpPort();
+  }
+  diagnostic["usb_preferred"] = true;
+  const uint32_t stateAge = uptimeMs - lastStateFrameAt;
+  diagnostic["host_state_frames"] = acceptedStateFrames;
+  diagnostic["host_state_seen"] = acceptedStateFrames != 0;
+  diagnostic["host_state_age_ms"] = acceptedStateFrames ? stateAge : 0;
+  diagnostic["host_state_live"] = acceptedStateFrames && stateAge < 30000;
+  diagnostic["host_state_usb_frames"] = acceptedUsbStateFrames;
+  diagnostic["host_state_tcp_frames"] = acceptedTcpStateFrames;
+  diagnostic["host_state_usb_age_ms"] = acceptedUsbStateFrames
+      ? uptimeMs - lastUsbStateFrameAt : 0;
+  diagnostic["host_state_tcp_age_ms"] = acceptedTcpStateFrames
+      ? uptimeMs - lastTcpStateFrameAt : 0;
+  diagnostic["host_protocol_frames"] = acceptedProtocolFrames;
+  diagnostic["host_protocol_usb_frames"] = acceptedUsbFrames;
+  diagnostic["host_protocol_tcp_frames"] = acceptedTcpFrames;
+  const uint32_t hostLastSeenAge = uptimeMs - state.lastSeenMs;
+  const bool hostLive = state.connected && hostLastSeenAge < 30000;
+  diagnostic["host_connected"] = state.connected;
+  diagnostic["host_last_seen_age_ms"] = state.connected ? hostLastSeenAge : 0;
+  diagnostic["host_live"] = hostLive;
+  diagnostic["rendered_face_live"] = hasRenderedFace ? lastRenderedFaceLive : false;
+  diagnostic["face_live_transitions"] = faceLiveTransitionCount;
+  diagnostic["face_offline_frames"] = faceOfflineRenderCount;
+  diagnostic["face_frames"] = faceRenderCount;
+  diagnostic["face_last_render_age_ms"] = lastFaceRenderAt
+      ? uptimeMs - lastFaceRenderAt : 0;
   sendJson(diagnostic);
 }
 
@@ -198,8 +275,13 @@ void sendPingReply() {
   reply["ack"] = "ping";
   reply["ok"] = true;
   sendJson(reply);
-  sendHello("usb");
+  const bool usbAlive = usbLastInputAt && millis() - usbLastInputAt < 30000;
+  sendHello(networkService.tcpConnected() && !usbAlive ? "tcp" : "usb");
   sendDiagnostic();
+}
+
+void noteUsbActivity(network::HostActivity activity) {
+  if (processingUsbLine && network::claimsUsbPriority(activity)) usbLastInputAt = millis();
 }
 
 void setStatusFields(uint32_t now) {
@@ -214,17 +296,20 @@ void setStatusFields(uint32_t now) {
     snprintf(clock, sizeof(clock), "RTC %02u:%02u:%02u", sensor.rtcHour, sensor.rtcMinute, sensor.rtcSecond);
     state.rtcStatus = clock;
   } else state.rtcStatus = "RTC invalid";
-  state.wifiStatus = "WiFi unsupported";
-  state.networkStatus = "network unsupported";
+  state.wifiStatus = networkService.wifiReady()
+      ? String("WiFi ") + networkService.localIp().toString()
+      : String("WiFi ") + networkService.wifiStatus();
+  state.networkStatus = String("TCP ") + networkService.tcpStatus();
   state.audioStatus = playback.ready() ? "ES8311 16 kHz" : "audio unavailable";
   state.motionStatus = sensor.accelerationReady
       ? String("ACC ") + String(sensor.accelerationXG, 1) + "," +
           String(sensor.accelerationYG, 1) + "," + String(sensor.accelerationZG, 1) + "g"
       : "IMU unavailable";
   state.freeHeap = ESP.getFreeHeap();
-  state.wifiConnected = false;
+  state.wifiConnected = networkService.wifiReady();
   state.bleConnected = false;
-  state.linkStatus = hostLastInputAt && now - hostLastInputAt < 30000 ? "USB HOST" : "USB READY";
+  state.linkStatus = usbLastInputAt && now - usbLastInputAt < 30000 ? "USB HOST" :
+      networkService.tcpConnected() ? "TCP HOST" : "USB READY";
 }
 
 const char* moodName(const String& mood) {
@@ -265,11 +350,57 @@ void paintFace(lgfx::LGFX_Sprite& sprite, const String& mood,
 }
 
 bool handleConfig(JsonDocument& request) {
+  const JsonObjectConst wifi = request["wifi"].as<JsonObjectConst>();
+  const JsonObjectConst host = request["host"].as<JsonObjectConst>();
+  if ((!request["wifi"].isNull() && !request["wifi"].is<JsonObjectConst>()) ||
+      (!request["host"].isNull() && !request["host"].is<JsonObjectConst>()) ||
+      (!request["display"].isNull() && !request["display"].is<JsonObjectConst>())) {
+    JsonDocument ack;
+    ack["ack"] = "config";
+    ack["ok"] = false;
+    ack["detail"] = "invalid-config-section";
+    sendJson(ack);
+    return false;
+  }
+  if (request["wifi"].is<JsonObjectConst>()) {
+    if ((!wifi["ssid"].isNull() && !wifi["ssid"].is<const char*>()) ||
+        (!wifi["password"].isNull() && !wifi["password"].is<const char*>()) ||
+        (wifi["ssid"].is<const char*>() && strlen(wifi["ssid"].as<const char*>()) > 32) ||
+        (wifi["password"].is<const char*>() && strlen(wifi["password"].as<const char*>()) > 63)) {
+      JsonDocument ack;
+      ack["ack"] = "config";
+      ack["ok"] = false;
+      ack["detail"] = "invalid-wifi-config";
+      sendJson(ack);
+      return false;
+    }
+  }
+  if (request["host"].is<JsonObjectConst>()) {
+    const JsonVariantConst port = host["port"];
+    if ((!host["ip"].isNull() && (!host["ip"].is<const char*>() ||
+         !network::isIpv4Literal(host["ip"].as<const char*>()))) ||
+        (!host["token"].isNull() && !host["token"].is<const char*>()) ||
+        (host["ip"].is<const char*>() && strlen(host["ip"].as<const char*>()) > 253) ||
+        (host["token"].is<const char*>() && strlen(host["token"].as<const char*>()) > 128) ||
+        (host["token"].is<const char*>() && host["token"].as<const char*>()[0] == '\0') ||
+        (!port.isNull() && (!port.is<uint16_t>() || port.as<uint16_t>() == 0))) {
+      JsonDocument ack;
+      ack["ack"] = "config";
+      ack["ok"] = false;
+      ack["detail"] = "invalid-host-config";
+      sendJson(ack);
+      return false;
+    }
+  }
   JsonDocument updates;
   for (const char* section : {"wifi", "host", "display"}) {
     if (request[section].is<JsonObjectConst>()) updates[section].set(request[section]);
   }
   const bool saved = updates.size() == 0 || assets.mergeConfiguration(updates.as<JsonObjectConst>());
+  if (saved && updates.size()) {
+    networkService.configure(updates["wifi"].as<JsonObjectConst>(), updates["host"].as<JsonObjectConst>());
+    networkService.begin();
+  }
   JsonDocument ack;
   ack["ack"] = "config";
   ack["ok"] = saved;
@@ -292,14 +423,17 @@ void processLine(const char* line) {
   const uint32_t now = millis();
   if (!strcmp(command, "ping")) {
     hostLastInputAt = now;
+    noteUsbActivity(network::HostActivity::Ping);
     sendPingReply();
     return;
   }
   if (!strcmp(command, "touchdiag")) {
+    noteUsbActivity(network::HostActivity::LocalCommand);
     sendDiagnostic();
     return;
   }
   if (!strcmp(command, "rtcset")) {
+    noteUsbActivity(network::HostActivity::LocalCommand);
     const char* const fields[] = {"year", "month", "day", "hour", "minute", "second"};
     int values[6] = {};
     bool fieldsValid = true;
@@ -311,8 +445,12 @@ void processLine(const char* line) {
       }
       values[i] = value.as<int>();
     }
-    const bool set = fieldsValid && sensors.setRtcDateTime(
-        values[0], values[1], values[2], values[3], values[4], values[5]);
+    bool set = false;
+    if (fieldsValid) {
+      peripherals::Wire1Lock lock(pdMS_TO_TICKS(100));
+      if (lock) set = sensors.setRtcDateTime(
+          values[0], values[1], values[2], values[3], values[4], values[5]);
+    }
     JsonDocument result;
     result["cmd"] = "rtcset";
     result["ok"] = set;
@@ -321,6 +459,7 @@ void processLine(const char* line) {
     return;
   }
   if (!strcmp(command, "audiotest")) {
+    noteUsbActivity(network::HostActivity::LocalCommand);
     const auto gainField = request["gain"];
     const int requestedGain = gainField.is<int>() ? gainField.as<int>() :
         gainField.isNull() ? 0x60 : -1;
@@ -342,20 +481,47 @@ void processLine(const char* line) {
     return;
   }
   if (!strcmp(command, "clear")) {
+    noteUsbActivity(network::HostActivity::Clear);
     state = protocol::UiState();
+    hostLastInputAt = now;
+    if (processingUsbLine) usbLastInputAt = millis();
     return;
   }
   if (!strcmp(type, "config")) {
+    noteUsbActivity(network::HostActivity::Config);
     handleConfig(request);
-    state.connected = true;
-    state.lastSeenMs = now;
     hostLastInputAt = now;
+    if (processingUsbLine) usbLastInputAt = millis();
     return;
   }
   if (!protocol::applyJsonFrame(state, String(line), now)) return;
+  noteUsbActivity(network::HostActivity::ProtocolFrame);
   hostLastInputAt = now;
-  if (!strcmp(type, "say")) {
-    const char* url = request["say"] | "";
+  const uint32_t receivedAt = millis();
+  ++acceptedProtocolFrames;
+  if (processingUsbLine) {
+    ++acceptedUsbFrames;
+  } else {
+    ++acceptedTcpFrames;
+  }
+  const bool stateFrame = request["total"].is<int>() || request["running"].is<int>() ||
+      request["waiting"].is<int>() || request["job_state"].is<const char*>() ||
+      request["entries"].is<JsonArrayConst>();
+  if (stateFrame) {
+    ++acceptedStateFrames;
+    lastStateFrameAt = receivedAt;
+    if (processingUsbLine) {
+      ++acceptedUsbStateFrames;
+      lastUsbStateFrameAt = receivedAt;
+    } else {
+      ++acceptedTcpStateFrames;
+      lastTcpStateFrameAt = receivedAt;
+    }
+  }
+  const char* speechUrl = protocol::speechUrlForFrame(
+      type, request["url"] | "", request["say"] | "");
+  if (speechUrl) {
+    const char* url = speechUrl;
     if (!playback.playUrl(url)) state.message = playback.ready() ? "Speech playback unavailable" : "Audio unavailable";
     else state.message = "Playing speech";
     state.dirty = true;
@@ -368,7 +534,9 @@ void pollSerial() {
     const char c = static_cast<char>(Serial.read());
     const protocol::SerialLineFramer<>::Result result = serialLineFramer.push(c);
     if (result == protocol::SerialLineFramer<>::Result::LineReady) {
+      processingUsbLine = true;
       processLine(serialLineFramer.line());
+      processingUsbLine = false;
     } else if (result == protocol::SerialLineFramer<>::Result::LineTooLong) {
       JsonDocument error;
       error["type"] = "error";
@@ -381,6 +549,28 @@ void pollSerial() {
       sendJson(error);
     }
   }
+}
+
+void processTcpLine(const char* line, void*) {
+  processingUsbLine = false;
+  processLine(line);
+}
+
+void loadNetworkConfiguration() {
+  if (!assets.sdReady()) return;
+  constexpr char kConfigPath[] = "/hermes-buddy-349-v1/config.json";
+  if (!SD_MMC.exists(kConfigPath)) return;
+  File file = SD_MMC.open(kConfigPath, FILE_READ);
+  if (!file || file.size() > 4096) {
+    if (file) file.close();
+    return;
+  }
+  JsonDocument config;
+  const DeserializationError error = deserializeJson(config, file);
+  file.close();
+  if (error || !config.is<JsonObject>()) return;
+  networkService.configure(config["wifi"].as<JsonObjectConst>(), config["host"].as<JsonObjectConst>());
+  networkService.begin();
 }
 
 void pollTouch(uint32_t now) {
@@ -413,7 +603,42 @@ void pollTouch(uint32_t now) {
     ++touchGestureCount;
     familiarUi.touchGesture(touchStartX, touchStartY, touchLastX, touchLastY,
                             now - touchStartedAt, now);
-    playback.chirp("tap");
+    if (!quietMode) playback.chirp("tap");
+  }
+}
+
+void pollPhysicalGesture() {
+  const peripherals::SensorSnapshot& sensor = sensors.snapshot();
+  if (sensor.gestureSequence == lastGestureSequence) return;
+  lastGestureSequence = sensor.gestureSequence;
+  const char* name = nullptr;
+  bool hasQuiet = false;
+  if (sensor.gesture == peripherals::Gesture::FaceDown) {
+    quietMode = true;
+    playback.setQuiet(true);
+    name = "facedown";
+    hasQuiet = true;
+  } else if (sensor.gesture == peripherals::Gesture::Upright) {
+    quietMode = false;
+    playback.setQuiet(false);
+    name = "upright";
+    hasQuiet = true;
+  } else if (sensor.gesture == peripherals::Gesture::Shake) {
+    name = "shake";
+  } else if (sensor.gesture == peripherals::Gesture::Tap2) {
+    name = "tap2";
+  } else if (sensor.gesture == peripherals::Gesture::Pickup) {
+    name = "pickup";
+  }
+  if (!name) return;
+  JsonDocument event;
+  event["cmd"] = "gesture";
+  event["gesture"] = name;
+  if (hasQuiet) event["quiet"] = quietMode;
+  sendJson(event);
+  if (!quietMode && (sensor.gesture == peripherals::Gesture::Upright ||
+                     sensor.gesture == peripherals::Gesture::Shake)) {
+    playback.chirp("ack");
   }
 }
 
@@ -452,7 +677,10 @@ void pollBootButton() {
         const int16_t x = allow.x + allow.w / 2, y = allow.y + allow.h / 2;
         familiarUi.touchGesture(x, y, x, y, 1, now);
       } else if (state.page == protocol::Page::Operations) {
-        Serial.println("{\"cmd\":\"action\",\"action\":\"start\"}");
+        JsonDocument action;
+        action["cmd"] = "action";
+        action["action"] = "start";
+        sendJson(action);
       }
     }
   }
@@ -464,13 +692,13 @@ void sendTelemetry(uint32_t now) {
   const auto& sensor = sensors.snapshot();
   JsonDocument telemetry;
   telemetry["cmd"] = "telemetry";
-  telemetry["usb"] = true;
-  telemetry["quiet"] = false;
+  telemetry["usb"] = usbLastInputAt && now - usbLastInputAt < 30000;
+  telemetry["quiet"] = quietMode;
   telemetry["bat"] = sensor.batterySampleReady ? sensor.batteryVolts : 0.0f;
   telemetry["rtc_valid"] = sensor.rtcTimeValid;
   telemetry["imu_ready"] = sensor.imuReady && sensor.accelerationReady;
   telemetry["audio_ready"] = playback.ready();
-  telemetry["wifi_ready"] = false;
+  telemetry["wifi_ready"] = networkService.wifiReady();
   sendJson(telemetry);
 }
 
@@ -497,7 +725,10 @@ void setup() {
   pinMode(board::kBootKey, INPUT_PULLUP);
   systemHoldReady = initializeHoldBus();
 
-  sensors.begin(Wire1, millis());
+  {
+    peripherals::Wire1Lock lock;
+    if (lock) sensors.begin(Wire1, millis());
+  }
   playback.begin();  // Codec starts muted; P7 stays low until a playback request.
   displayReady = lcd.begin();
   if (displayReady) {
@@ -508,6 +739,7 @@ void setup() {
   artworkScratch = static_cast<uint16_t*>(heap_caps_malloc(kArtworkPixels * sizeof(uint16_t),
       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   assets.begin();
+  loadNetworkConfiguration();
   familiarUi.setFacePainter(paintFace);
   setStatusFields(millis());
   sendHello("usb");
@@ -525,10 +757,21 @@ void setup() {
 
 void loop() {
   pollSerial();
+  // Select transport from the last *host* activity, then refresh the UI time
+  // after both TCP and USB frames have updated state.lastSeenMs. Passing a
+  // pre-receive timestamp to FamiliarUi makes unsigned liveness subtraction
+  // wrap and paints a one-frame IDLE flash on every TCP heartbeat.
+  const uint32_t transportNow = millis();
+  const bool usbAlive = usbLastInputAt && transportNow - usbLastInputAt < 30000;
+  networkService.poll(usbAlive, processTcpLine, nullptr);
   const uint32_t now = millis();
   pollPowerKey(now);
   pollBootButton();
-  sensors.update(now);
+  {
+    peripherals::Wire1Lock lock;
+    if (lock) sensors.update(now);
+  }
+  pollPhysicalGesture();
   if (now - lastStatusUpdateAt >= 1000) {
     setStatusFields(now);
     lastStatusUpdateAt = now;
@@ -538,7 +781,17 @@ void loop() {
 
   familiarUi.tick(now);
   if (displayReady && canvasReady && (state.dirty || now - lastRenderAt >= kRenderIntervalMs)) {
-    familiarUi.render(now);
+    const uint32_t renderAt = millis();
+    familiarUi.render(renderAt);
+    if (state.page == protocol::Page::Face && !state.modalActive) {
+      const bool live = state.connected && renderAt - state.lastSeenMs < 30000;
+      if (hasRenderedFace && live != lastRenderedFaceLive) ++faceLiveTransitionCount;
+      hasRenderedFace = true;
+      lastRenderedFaceLive = live;
+      ++faceRenderCount;
+      if (!live) ++faceOfflineRenderCount;
+      lastFaceRenderAt = renderAt;
+    }
     if (!lcd.present(static_cast<const uint16_t*>(canvas.getBuffer()),
                      static_cast<size_t>(ui::FamiliarUi::kWidth * ui::FamiliarUi::kHeight))) {
       displayReady = false;

@@ -23,6 +23,33 @@ bool has(const Capture& capture, const std::string& fragment) {
   return false;
 }
 
+bool textHas(const lgfx::LGFX_Sprite& sprite, const std::string& fragment) {
+  for (const auto& call : sprite.calls) if (call.text.find(fragment) != std::string::npos) return true;
+  return false;
+}
+
+bool isValidUtf8(const std::string& text) {
+  for (size_t i = 0; i < text.size();) {
+    const uint8_t lead = static_cast<uint8_t>(text[i]);
+    size_t length = lead < 0x80 ? 1 : (lead & 0xe0) == 0xc0 ? 2 :
+                    (lead & 0xf0) == 0xe0 ? 3 : (lead & 0xf8) == 0xf0 ? 4 : 0;
+    if (!length || i + length > text.size()) return false;
+    for (size_t byte = 1; byte < length; ++byte)
+      if ((static_cast<uint8_t>(text[i + byte]) & 0xc0) != 0x80) return false;
+    i += length;
+  }
+  return true;
+}
+
+void assertTextCallsFit(const lgfx::LGFX_Sprite& sprite) {
+  for (const auto& call : sprite.calls) {
+    assert(isValidUtf8(call.text));
+    assert(call.x >= 0 && call.width >= 0 && call.x + call.width <= ui::FamiliarUi::kWidth);
+    const int height = static_cast<int>(12 * call.size);
+    assert(call.y >= 0 && call.y + height <= ui::FamiliarUi::kHeight);
+  }
+}
+
 size_t count(const Capture& capture, const std::string& fragment) {
   size_t matches = 0;
   for (const auto& line : capture.lines) matches += line.find(fragment) != std::string::npos;
@@ -183,6 +210,254 @@ void testMessageHistoryRequests() {
   assert(has(sent, "\"cmd\":\"msgs\""));
   assert(has(sent, "\"off\":5"));
 }
+
+void testUtf8TypographyMeasuredWrappingAcrossPages() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+
+  state.connected = true;
+  state.lastSeenMs = 100;
+  state.page = protocol::Page::Fleet;
+  auto& fleet = state.hostPages[2];
+  fleet.set = true;
+  fleet.title = "Семейство — fleet";
+  fleet.lines[0] = "Привет мир — кириллица читается без повреждения UTF-8";
+  fleet.lines[1] = "Команда rm *.json сохраняет glob и пробелы";
+  fleet.lines[2] = "Длинная строка содержит достаточно слов чтобы корректно переноситься по ширине и показывать многоточие если высоты строки недостаточно для всего текста";
+
+  view.render(200);
+  assert(sprite.selectedFont == &fonts::efontJA_12);
+  assert(!sprite.wrapX && !sprite.wrapY);
+  assert(textHas(sprite, "Привет"));
+  assert(textHas(sprite, "*.json"));
+  assert(textHas(sprite, "..."));
+  for (const auto& call : sprite.calls) {
+    assert(isValidUtf8(call.text));
+    assert(call.x >= 0 && call.width >= 0 && call.x + call.width <= ui::FamiliarUi::kWidth);
+    assert(call.size >= 0.8f);
+  }
+
+  // Populate every page with bounded synthetic Unicode test content. These
+  // assertions cover recorded API calls and geometry, not physical glyph output.
+  state.jobLabel = "Очень длинная подпись задачи для проверки переноса текста";
+  state.message = "Задача обработана — длинная строка с кириллицей для проверки ширины шрифта и многоточия";
+  state.toast = "Состояние обновлено — проверка сообщения";
+  state.toastUntilMs = 5000;
+  state.entryCount = 5;
+  state.historyCount = 5;
+  state.historyOffset = 5;
+  state.historyTotal = 20;
+  for (uint8_t i = 0; i < 5; ++i) {
+    state.entries[i] = "Событие пользователя с длинным текстом для проверки ширины — запись " + String(i);
+    state.history[i] = "Историческое сообщение на русском языке с проверкой переноса строки " + String(i);
+  }
+  state.hostPages[0].set = true;
+  state.hostPages[0].title = "Расписание заданий";
+  state.hostPages[0].lines[0] = "Задание работает успешно — описание с длинным текстом";
+  state.hostPages[0].lines[1] = fleet.lines[2];
+  state.hostPages[0].lines[2] = "Следующий запуск состоится позже";
+  state.hostPages[1].set = true;
+  state.hostPages[1].title = "Сетевая конфигурация";
+  state.hostPages[1].lines[0] = "Wi-Fi подключён, адрес задан — длинное сообщение состояния";
+  state.hostPages[1].lines[1] = "Сервер доступен по локальной сети";
+  state.hostPages[1].lines[2] = "Синхронизация завершена успешно";
+  state.sdStatus = "SD карта готова";
+  state.touchStatus = "сенсор касания готов";
+  state.batteryStatus = "питание 4.1 V";
+  state.rtcStatus = "время синхронизировано";
+  state.wifiStatus = "Wi-Fi подключён";
+  state.networkStatus = "сеть работает";
+  state.audioStatus = "аудио готово";
+  state.motionStatus = "движение: 0.02, 0.01, 1.00 g";
+  state.linkStatus = "USB READY";
+
+  for (uint8_t page = 0; page < 7; ++page) {
+    state.page = static_cast<protocol::Page>(page);
+    view.render(300 + page);
+    assert(sprite.selectedFont == &fonts::efontJA_12 && !sprite.wrapX);
+    assertTextCallsFit(sprite);
+  }
+
+  state.page = protocol::Page::Messages;
+  view.render(400);
+  assert(textHas(sprite, "RECENT TRAFFIC") || textHas(sprite, "HISTORY"));
+  assertTextCallsFit(sprite);
+  state.historyOffset = 0;
+  view.render(401);
+  assert(textHas(sprite, "RECENT TRAFFIC"));
+  assertTextCallsFit(sprite);
+
+  state.page = protocol::Page::Operations;
+  state.deckCount = 1;
+  state.deck[0].label = "Очень длинная подпись для действия в колоде";
+  state.jobState = "running";
+  view.render(402);
+  assertTextCallsFit(sprite);
+
+  state.approval.active = true;
+  state.approval.id = "approval-test";
+  state.approval.text = "rm *.json --flag C:\\temp\\queue";
+  state.approval.detail = "Проверка текста подтверждения и подробного описания";
+  view.render(403);
+  assert(textHas(sprite, "*.json"));
+  assert(textHas(sprite, "--flag"));
+  assertTextCallsFit(sprite);
+  const ui::Rect detail = ui::FamiliarUi::approvalTextRect();
+  tap(view, detail.x + 10, detail.y + 10, 404);
+  view.render(405);
+  assert(state.modalActive);
+  assert(textHas(sprite, "swipe up/down to read"));
+  assert(textHas(sprite, "*.json"));
+  assertTextCallsFit(sprite);
+}
+
+void testFaceLivenessAtExpiryAndMillisWrap() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.connected = true;
+  state.lastSeenMs = 100;
+  state.page = protocol::Page::Face;
+
+  view.render(30099);
+  assert(textHas(sprite, "ONLINE"));
+  view.render(30100);
+  assert(textHas(sprite, "OFFLINE"));
+
+  state.lastSeenMs = 0xfffffff0u;
+  view.render(29983u);
+  assert(textHas(sprite, "ONLINE"));  // 29,999 ms across millis wrap.
+  view.render(29984u);
+  assert(textHas(sprite, "OFFLINE"));  // Exactly 30,000 ms.
+}
+
+void testTextKeepsFilledTabAndRunningCardBackgrounds() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Operations;
+  state.deckCount = 1;
+  state.deck[0].label = "RUN TASK";
+  state.runningDeck = 0;
+  view.render(100);
+  bool selectedTabKeepsPanel = false;
+  bool runningLabelKeepsTile = false;
+  bool stopLabelKeepsTile = false;
+  for (const auto& call : sprite.calls) {
+    if (call.text == "OPS") selectedTabKeepsPanel = call.background == 0x0841;
+    if (call.text == "RUN TASK") runningLabelKeepsTile = call.background != 0;
+    if (call.text == "STOP") stopLabelKeepsTile = call.background != 0;
+  }
+  assert(selectedTabKeepsPanel && runningLabelKeepsTile && stopLabelKeepsTile);
+}
+
+void testHostRowsCompactBlankParagraphsAndTapRenderedRow() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Fleet;
+  auto& fleet = state.hostPages[2];
+  fleet.set = true;
+  fleet.title = "Fleet";
+  fleet.lines[0] = "first row\n\n\ncontinued row";
+  fleet.lines[1] = "short row";
+  fleet.lines[2] = "last row";
+
+  view.render(100);
+  int secondRowY = -1;
+  for (const auto& call : sprite.calls)
+    if (call.text == "short row") secondRowY = call.y;
+  assert(secondRowY == 78);  // Two compact 13px lines plus two pixels of row padding.
+  tap(view, 20, secondRowY + 1, 101);
+  assert(state.modalActive && state.modalBody == "short row");
+  assert(state.modalReturn == protocol::Page::Fleet);
+}
+
+void testStatsModalRowsUseCompactMeasuredSpacing() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.modalActive = true;
+  state.modal.title = "STATS";
+  state.modal.lines[0] = "S:42 tok:18k tools:7";
+  state.modal.lines[1] = "job idle Status brief";
+  state.modal.lines[2] = "up 3h17m serial";
+
+  view.render(100);
+  int statsY[3] = {-1, -1, -1};
+  for (const auto& call : sprite.calls) {
+    if (call.text == "S:42 tok:18k tools:7") statsY[0] = call.y;
+    if (call.text == "job idle Status brief") statsY[1] = call.y;
+    if (call.text == "up 3h17m serial") statsY[2] = call.y;
+  }
+  assert(statsY[0] == 50);
+  assert(statsY[1] == 65);
+  assert(statsY[2] == 80);
+
+  state.modal.lines[0] = String(std::string(1000, 'x'));
+  view.render(101);
+  int secondRowY = -1, thirdRowY = -1;
+  for (const auto& call : sprite.calls) {
+    if (call.text == "job idle Status brief") secondRowY = call.y;
+    if (call.text == "up 3h17m serial") thirdRowY = call.y;
+    if (call.text.find('x') != std::string::npos)
+      assert(call.y >= 50 && call.y + 12 <= 152);
+  }
+  assert(secondRowY == 117);  // Five visible lines, then 2px row padding.
+  assert(thirdRowY == 132);   // The following STATS rows keep one line each.
+}
+
+void testLatestResponseOpensScrollableModalFromFaceAndMessages() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.connected = true;
+  state.lastSeenMs = 100;
+  state.agentResponseMarkdown = "## Заголовок\n\n- Ответ агента с **выделением** и *курсивом*, затем [ссылка](https://example.invalid).\n\n```sh\nrm *.json --flag\n```\n\nТретий абзац с продолжением ответа.\n\nЧетвёртый абзац с продолжением ответа.\n\nПятый абзац с продолжением ответа.\n\nШестой абзац с продолжением ответа.\n\nСедьмой абзац с продолжением ответа.\n\nВосьмой абзац с продолжением ответа.";
+  state.agentResponseMarkdownTruncated = true;
+  state.page = protocol::Page::Face;
+  tap(view, 180, 120, 101);
+  assert(state.modalActive && state.modalReturn == protocol::Page::Face);
+  view.render(102);
+  assert(textHas(sprite, "Заголовок"));
+  assert(!textHas(sprite, "##"));
+  assert(textHas(sprite, "выделением"));
+  assert(textHas(sprite, "курсивом"));
+  assert(textHas(sprite, "ссылка"));
+  assert(textHas(sprite, "rm *.json --flag"));
+  assert(textHas(sprite, "response shortened"));
+  bool linkAccent = false, codePanel = false, headingAccent = false;
+  for (const auto& call : sprite.calls) {
+    if (call.text == "ссылка") linkAccent = call.foreground == 0x07F5;
+    if (call.text == "rm *.json --flag") codePanel = call.background == 0x0841;
+    if (call.text == "Заголовок") headingAccent = call.foreground == 0xFEE0;
+  }
+  assert(linkAccent && codePanel && headingAccent);
+  view.touchGesture(300, 130, 300, 60, 150, 103);
+  state.agentResponseMarkdown = "## Replacement B";
+  state.agentResponseMarkdownTruncated = false;
+  view.render(104);
+  assert(!textHas(sprite, "Заголовок"));
+  assert(textHas(sprite, "Четвёртый абзац"));
+  assert(!textHas(sprite, "Replacement B"));
+  assert(textHas(sprite, "response shortened"));
+  tap(view, 300, 100, 105);
+  assert(!state.modalActive && state.page == protocol::Page::Face);
+
+  state.page = protocol::Page::Messages;
+  state.entryCount = 1;
+  state.entries[0] = "Latest response preview";
+  tap(view, 50, 50, 106);
+  assert(state.modalActive && state.modalReturn == protocol::Page::Messages);
+  assert(state.modalBody == "## Replacement B");
+}
 }  // namespace
 
 int main() {
@@ -191,5 +466,11 @@ int main() {
   testApprovalRequiresLiveCurrentRequestAndExactButtons();
   testSwipeCannotResolveApprovalAndModalReturnsToOrigin();
   testMessageHistoryRequests();
+  testUtf8TypographyMeasuredWrappingAcrossPages();
+  testFaceLivenessAtExpiryAndMillisWrap();
+  testTextKeepsFilledTabAndRunningCardBackgrounds();
+  testHostRowsCompactBlankParagraphsAndTapRenderedRow();
+  testStatsModalRowsUseCompactMeasuredSpacing();
+  testLatestResponseOpensScrollableModalFromFaceAndMessages();
   std::cout << "Familiar UI native regression tests passed\n";
 }

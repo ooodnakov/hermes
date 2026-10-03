@@ -5,6 +5,8 @@
 
 namespace peripherals {
 
+enum class Gesture : uint8_t { None, FaceDown, Upright, Shake, Tap2, Pickup };
+
 // Sensor access for the V1 peripheral bus. The caller owns and initializes
 // the bus; this module never calls TwoWire::begin/end.
 struct SensorSnapshot {
@@ -31,6 +33,10 @@ struct SensorSnapshot {
   float accelerationXG = 0.0f;
   float accelerationYG = 0.0f;
   float accelerationZG = 0.0f;
+  // Latest physical gesture and a monotonic event sequence. Consumers compare
+  // the sequence to avoid losing events between their UI ticks.
+  Gesture gesture = Gesture::None;
+  uint32_t gestureSequence = 0;
 
   uint16_t rtcErrors = 0;
   uint16_t imuErrors = 0;
@@ -59,6 +65,15 @@ class Sensors {
   uint32_t lastImuMs_ = 0;
   uint32_t lastImuRecoveryMs_ = 0;
   uint8_t consecutiveImuErrors_ = 0;
+  float lastAccelerationMagnitude_ = 1.0f;
+  float baseX_ = 0.0f, baseY_ = 0.0f, baseZ_ = 0.0f;
+  bool baseSet_ = false;
+  bool quietMode_ = false;
+  uint8_t basePolls_ = 0, faceDownPolls_ = 0, uprightPolls_ = 0;
+  uint32_t lastShakeMs_ = 0, previousTapPulseMs_ = 0, lastMotionMs_ = 0;
+  uint32_t imuStartedMs_ = 0;
+  bool tapArmed_ = true;
+  bool haveLastAccelerationMagnitude_ = false;
 
   bool readRegister(uint8_t address, uint8_t reg, uint8_t& value);
   bool readRegisters(uint8_t address, uint8_t reg, uint8_t* data, size_t length);
@@ -67,6 +82,8 @@ class Sensors {
   void sampleBattery();
   void sampleRtc();
   void sampleImu(uint32_t nowMs);
+  void detectGesture(uint32_t nowMs);
+  void emitGesture(Gesture gesture);
 };
 
 }  // namespace peripherals

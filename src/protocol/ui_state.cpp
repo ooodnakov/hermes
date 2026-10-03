@@ -1,12 +1,33 @@
 #include "ui_state.h"
 
 #include <ArduinoJson.h>
+#include <cstring>
 
 namespace protocol {
 namespace {
+constexpr size_t kMaxAgentMarkdownBytes = 3072;
 
 String textOr(JsonVariantConst value, const char* fallback = "") {
   return value.is<const char*>() ? String(value.as<const char*>()) : String(fallback);
+}
+
+String boundedMarkdown(JsonVariantConst value, bool& truncated) {
+  truncated = false;
+  if (!value.is<const char*>()) return String();
+  const char* raw = value.as<const char*>();
+  if (!raw) return String();
+  size_t length = strlen(raw);
+  if (length > kMaxAgentMarkdownBytes) {
+    truncated = true;
+    length = kMaxAgentMarkdownBytes;
+    // Do not leave a UTF-8 continuation byte at the beginning of the removed
+    // tail. JSON byte capacity is fixed, but text length is counted in bytes.
+    while (length && (static_cast<uint8_t>(raw[length]) & 0xc0) == 0x80) --length;
+  }
+  String result;
+  result.reserve(length);
+  for (size_t i = 0; i < length; ++i) result += raw[i];
+  return result;
 }
 
 void markLive(UiState& s, uint32_t nowMs) {
@@ -23,7 +44,7 @@ bool applyJsonFrame(UiState& s, const String& line, uint32_t nowMs) {
   // approval details readable without placing a large static document on the
   // loop task's stack.
   JsonDocument doc;
-  if (deserializeJson(doc, line)) return false;
+  if (deserializeJson(doc, line.c_str())) return false;
   JsonVariantConst root = doc.as<JsonVariantConst>();
   const char* type = root["type"] | "";
   const char* cmd = root["cmd"] | "";
@@ -141,6 +162,12 @@ bool applyJsonFrame(UiState& s, const String& line, uint32_t nowMs) {
   for (JsonVariantConst value : root["entries"].as<JsonArrayConst>()) {
     if (s.entryCount == 5) break;
     s.entries[s.entryCount++] = textOr(value);
+  }
+  if (root["msg_markdown"].is<const char*>()) {
+    bool locallyTruncated = false;
+    s.agentResponseMarkdown = boundedMarkdown(root["msg_markdown"], locallyTruncated);
+    s.agentResponseMarkdownTruncated =
+        locallyTruncated || (root["msg_markdown_truncated"] | false);
   }
   markLive(s, nowMs);
   return true;

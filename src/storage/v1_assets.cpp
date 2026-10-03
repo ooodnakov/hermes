@@ -393,7 +393,15 @@ bool V1Assets::mergeConfiguration(JsonObjectConst updates) {
     existing.close();
     if (parseError) { record(AssetError::ConfigParse); return false; }
   }
-  for (JsonPairConst pair : updates) config[pair.key()] = pair.value();
+  for (JsonPairConst pair : updates) {
+    JsonVariant target = config[pair.key()];
+    if (pair.value().is<JsonObjectConst>()) {
+      JsonObject section = target.is<JsonObject>() ? target.as<JsonObject>() : config[pair.key()].to<JsonObject>();
+      for (JsonPairConst field : pair.value().as<JsonObjectConst>()) section[field.key()] = field.value();
+    } else {
+      target.set(pair.value());
+    }
+  }
   return writeJsonAtomically(config);
 }
 

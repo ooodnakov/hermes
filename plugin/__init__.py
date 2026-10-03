@@ -100,10 +100,15 @@ _TOOL_STATUS = {
 _STATS_REFRESH_SECS = 60.0
 
 _lock = threading.Lock()
+_MAX_AGENT_MARKDOWN_BYTES = 3072
+_MAX_DEVICE_JSON_BYTES = 4095
+_MARKDOWN_CLIPPED_MARKER = "\n\n[Response clipped]"
 _turns: set[str] = set()                  # session_ids with an LLM call in flight
 _pending: OrderedDict[str, str] = OrderedDict()   # approval session_key -> text
 _entries: deque[str] = deque(maxlen=40)   # newest-first ticker; device shows 5, scrollback pages the rest
 _msg = "Familiar linked to Hermes"
+_agent_response_markdown = ""
+_agent_response_markdown_truncated = False
 _stats = {"total": 0, "tokens_today": 0, "tools_today": 0, "at": 0.0}
 
 _link: SerialLink | None = None
@@ -319,7 +324,7 @@ def _payload() -> dict:
     jobs = _jobs.status() if _jobs else {"job_state": "idle", "job_label": ""}
     with _lock:
         running = 1 if _turns or jobs.get("job_state") in ("running", "paused") else 0
-        return {
+        payload = {
             "type": "state",
             "total": _stats["total"],
             "running": running,
@@ -332,6 +337,89 @@ def _payload() -> dict:
             "transport": getattr(_link, "transport", "none") if _link is not None else "none",
             **jobs,
         }
+        markdown = _agent_response_markdown
+        markdown_truncated = _agent_response_markdown_truncated
+    return _fit_markdown_state_frame(payload, markdown, markdown_truncated)
+
+
+def _utf8_prefix(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Return a valid UTF-8 prefix within *max_bytes* and whether text was cut."""
+    pieces: list[str] = []
+    used = 0
+    for char in text:
+        # Replace unpaired surrogates, which cannot be represented in UTF-8.
+        if 0xD800 <= ord(char) <= 0xDFFF:
+            char = "\ufffd"
+        width = len(char.encode("utf-8"))
+        if used + width > max_bytes:
+            return "".join(pieces), True
+        pieces.append(char)
+        used += width
+    return "".join(pieces), False
+
+
+def _wire_json_size(frame: dict) -> int:
+    # SerialLink uses json.dumps with default ensure_ascii=True. Measure those
+    # exact bytes because Cyrillic and emoji expand to \u escapes on the wire.
+    return len(json.dumps(frame, separators=(",", ":"), ensure_ascii=True).encode("ascii"))
+
+
+def _fit_markdown_state_frame(base: dict, markdown: str, was_truncated: bool) -> dict:
+    """Add a codepoint-safe optional field while respecting USB/TCP line size."""
+    marker_bytes = len(_MARKDOWN_CLIPPED_MARKER.encode("utf-8"))
+
+    def candidate(chars: int, clipped: bool) -> dict:
+        frame = dict(base)
+        prefix = markdown[:chars]
+        if clipped:
+            prefix, _ = _utf8_prefix(prefix, _MAX_AGENT_MARKDOWN_BYTES - marker_bytes)
+            frame["msg_markdown"] = prefix + _MARKDOWN_CLIPPED_MARKER
+            frame["msg_markdown_truncated"] = True
+        else:
+            frame["msg_markdown"] = prefix
+            frame["msg_markdown_truncated"] = False
+        return frame
+
+    markdown, cap_truncated = _utf8_prefix(markdown, _MAX_AGENT_MARKDOWN_BYTES)
+    clipped = was_truncated or cap_truncated
+    full = candidate(len(markdown), clipped)
+    if _wire_json_size(full) <= _MAX_DEVICE_JSON_BYTES:
+        return full
+
+    # Search by Python codepoints; each candidate is escaped and measured as a
+    # complete frame, including current entries, job fields, and JSON overhead.
+    low, high = 0, len(markdown)
+    best = None
+    while low <= high:
+        middle = (low + high) // 2
+        frame = candidate(middle, True)
+        if _wire_json_size(frame) <= _MAX_DEVICE_JSON_BYTES:
+            best = frame
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best is not None:
+        return best
+
+    # If the non-Markdown payload itself consumes the line budget, preserve the
+    # state fields needed to keep the familiar alive and clear the old response
+    # instead of returning an overlong frame or leaving stale Markdown visible.
+    frame = {
+        "type": "state",
+        "total": base.get("total", 0),
+        "running": base.get("running", 0),
+        "waiting": base.get("waiting", 0),
+    }
+    preview, _ = _utf8_prefix(str(base.get("msg", "")), 256)
+    frame["msg"] = preview
+    frame["msg_markdown"] = ""
+    frame["msg_markdown_truncated"] = True
+    if _wire_json_size(frame) > _MAX_DEVICE_JSON_BYTES:
+        # This can only happen if future protocol code changes the core fields
+        # to unbounded values; fail closed rather than violate line framing.
+        frame = {"type": "state", "total": 0, "running": 0, "waiting": 0,
+                 "msg": "", "msg_markdown": "", "msg_markdown_truncated": True}
+    return frame
 
 
 def _push(extra: dict | None = None) -> None:
@@ -385,15 +473,22 @@ def _on_post_tool(**kw):
 
 
 def _on_post_llm(assistant_response="", platform="", session_id="", **kw):
+    global _msg, _agent_response_markdown, _agent_response_markdown_truncated
+    raw = str(assistant_response or "")
+    text = _actions.compact(raw, 140)
+    src = str(platform or "").strip()
+    markdown = raw if text else ""
     with _lock:
         _turns.discard(str(session_id or "?"))
-    text = _actions.compact(str(assistant_response or ""), 140)
-    if text:
-        stamp = datetime.now().strftime("%H:%M")
-        src = str(platform or "").strip()
-        with _lock:
+        _agent_response_markdown, _agent_response_markdown_truncated = _utf8_prefix(
+            markdown, _MAX_AGENT_MARKDOWN_BYTES)
+        if text:
+            stamp = datetime.now().strftime("%H:%M")
             _entries.appendleft(f"{stamp} a: {_actions.compact(text, 70)}")
-        _set_msg(text if not src else f"[{src}] {text}"[:140])
+            _msg = text if not src else f"[{src}] {text}"[:140]
+        else:
+            _msg = "No text response"
+    if text:
         if _link is not None:
             logger.info("push: reply platform=%s len=%d connected=%s",
                         src, len(text), _link.connected)
@@ -549,9 +644,14 @@ def _handle_device_line(evt: dict, origin: str = "usb") -> None:
         decision = str(evt.get("decision") or "once")
         want = str(evt.get("id") or "")
         with _lock:
-            key = want if want in _pending else (next(iter(_pending), ""))
+            # A stale/non-empty approval id must never fall through to another
+            # pending command. Only id-less legacy clients use FIFO selection.
+            key = want if want in _pending else (next(iter(_pending), "") if not want else "")
         if not key:
-            _push({"type": "ack", "msg": "no pending approval", "waiting": 0})
+            with _lock:
+                waiting = len(_pending)
+            _push({"type": "ack", "msg": "stale approval id" if want else "no pending approval",
+                   "waiting": waiting})
             return
         try:
             n = _actions._resolve_approval(key, decision)
@@ -730,6 +830,9 @@ def register(ctx) -> None:
     _voice_port = int(vc.get("port", 8765))
     _voice_cfg.update(vc)
     _voice.set_volume(vc.get("volume", 1.0))
+    _voice.configure_provider(
+        vc.get("provider", "hermes"), model=vc.get("model"),
+        voice=vc.get("voice"), language=vc.get("language"))
     _loom_cfg.update(cfg.get("loom") or {})
     _ritual_cfg.update(cfg.get("ritual") or {})
     _ctx["ctx"] = ctx

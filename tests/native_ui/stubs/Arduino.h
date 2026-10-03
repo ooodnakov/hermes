@@ -13,6 +13,7 @@ class String {
   String() = default;
   String(const char* value) : value_(value ? value : "") {}
   String(const std::string& value) : value_(value) {}
+  const char* c_str() const { return value_.c_str(); }
   String(int value) : value_(std::to_string(value)) {}
   String(uint32_t value) : value_(std::to_string(value)) {}
 
@@ -42,6 +43,9 @@ class String {
   }
   friend String operator+(const char* left, const String& right) {
     return String((left ? left : "") + right.value_);
+  }
+  friend bool operator==(const String& left, const char* right) {
+    return left.value_ == (right ? right : "");
   }
 
  private:

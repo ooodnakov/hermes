@@ -19,6 +19,17 @@ enum class DiagnosticError : uint8_t {
   GainRejected,
   GainWrite,
   GainReadback,
+  WifiUnavailable,
+  UrlRejected,
+  TaskCreate,
+  HttpBegin,
+  HttpStatus,
+  HttpEncoding,
+  HttpTimeout,
+  HttpTooLarge,
+  PcmMalformed,
+  OutputCleanup,
+  QuietMode,
   Unknown,
 };
 
@@ -36,6 +47,13 @@ struct Diagnostics {
   int32_t lastTestGainRequested = 0;
   uint8_t lastTestGainReadback = 0;
   bool baselineRestored = true;
+  uint32_t speechRequests = 0;
+  uint32_t speechSuccesses = 0;
+  uint32_t speechFailures = 0;
+  uint32_t speechSkips = 0;
+  uint32_t speechBytesReceived = 0;
+  uint32_t lastSpeechBytes = 0;
+  int32_t lastHttpStatus = 0;
   DiagnosticError lastError = DiagnosticError::None;
 };
 
@@ -45,6 +63,8 @@ class V1Es8311 {
  public:
   bool begin();
   void disable();
+  void setQuiet(bool quiet);
+  bool quiet() const;
   bool ready() const { return ready_; }
   bool playMonoPcm(const int16_t* samples, size_t count);
   bool chirp(const char* kind);
@@ -67,7 +87,8 @@ class V1Es8311 {
   bool speechBusy_ = false;
   bool chirpBusy_ = false;
   bool pcmBusy_ = false;
-  portMUX_TYPE stateMux_ = portMUX_INITIALIZER_UNLOCKED;
+  bool quiet_ = false;
+  mutable portMUX_TYPE stateMux_ = portMUX_INITIALIZER_UNLOCKED;
 };
 
 extern V1Es8311 v1Playback;

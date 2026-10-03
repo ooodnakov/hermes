@@ -108,6 +108,43 @@ def test_welcome_snapshot_on_connect():
     s.close()
 
 
+def test_tcp_only_link_keeps_sending_state_heartbeats():
+    """A device on TCP with no USB serial must stay live past the UI timeout."""
+    link, _seen = make_link()
+    link._heartbeat = 0.05
+    link._make_heartbeat = lambda: {"type": "state", "running": 0, "waiting": 0}
+    # Force the actual _run no-USB branch without probing workstation ports.
+    link._connect = lambda: None
+    port = link.start_tcp(0)
+    s = tcp_connect(port)
+    s.settimeout(0.1)
+    assert wait_for(lambda: len(link._net_clients) == 1)
+    link.start()
+    try:
+        states = []
+        buf = b""
+        deadline = time.time() + 3.3
+        while time.time() < deadline:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                frame = json.loads(line)
+                if frame.get("type") == "state":
+                    states.append(frame)
+        assert len(states) >= 3
+        assert link._ser is None
+        assert len(link._net_clients) == 1
+    finally:
+        link.stop()
+        s.close()
+
+
 def test_tcp_no_token_is_open_backcompat():
     # device firmware pre-auth: no token configured -> old behavior
     link, seen = make_link()

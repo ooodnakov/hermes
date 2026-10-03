@@ -1,6 +1,8 @@
 #include "v1_es8311.h"
+#include "pcm16.h"
 
 #include "../boards/v1/board_config.h"
+#include "../peripherals/bus_lock.h"
 
 #include <HTTPClient.h>
 #include <WiFi.h>
@@ -25,6 +27,17 @@ const char* diagnosticErrorName(DiagnosticError error) {
     case DiagnosticError::GainRejected: return "gain_rejected";
     case DiagnosticError::GainWrite: return "gain_write";
     case DiagnosticError::GainReadback: return "gain_readback";
+    case DiagnosticError::WifiUnavailable: return "wifi_unavailable";
+    case DiagnosticError::UrlRejected: return "url_rejected";
+    case DiagnosticError::TaskCreate: return "task_create";
+    case DiagnosticError::HttpBegin: return "http_begin";
+    case DiagnosticError::HttpStatus: return "http_status";
+    case DiagnosticError::HttpEncoding: return "http_encoding";
+    case DiagnosticError::HttpTimeout: return "http_timeout";
+    case DiagnosticError::HttpTooLarge: return "http_too_large";
+    case DiagnosticError::PcmMalformed: return "pcm_malformed";
+    case DiagnosticError::OutputCleanup: return "output_cleanup";
+    case DiagnosticError::QuietMode: return "quiet_mode";
     default: return "unknown";
   }
 }
@@ -46,6 +59,11 @@ constexpr uint8_t kVendorMaxGainRegister = 0xBA;
 constexpr uint32_t kI2sDmaDescriptors = 6;
 constexpr uint32_t kI2sDmaFrames = 240;
 constexpr uint32_t kDrainGuardMs = 10;
+constexpr size_t kMaxSpeechBytes = 16000U * 2U * 60U;  // At most one minute of mono PCM.
+constexpr uint32_t kMaxSpeechTaskMs = 65000;
+constexpr size_t kMaxSpeechUrlLength = 512;
+constexpr uint8_t kOutputCleanupAttempts = 3;
+constexpr uint32_t kOutputCleanupLockWaitMs = 200;
 constexpr uint32_t kTxDrainMs =
     (kI2sDmaDescriptors * kI2sDmaFrames * 1000 + kSampleRate - 1) / kSampleRate + kDrainGuardMs;
 static_assert(kTxDrainMs < 250, "manual audio feedback must remain bounded");
@@ -132,7 +150,37 @@ void finishGainTestDiagnostic(uint8_t testReadback, bool restored) {
   portEXIT_CRITICAL(&audioDiagnosticsMux);
 }
 
+void beginSpeechDiagnostic() {
+  portENTER_CRITICAL(&audioDiagnosticsMux);
+  ++audioDiagnostics.speechRequests;
+  audioDiagnostics.lastSpeechBytes = 0;
+  audioDiagnostics.lastHttpStatus = 0;
+  audioDiagnostics.lastError = DiagnosticError::None;
+  portEXIT_CRITICAL(&audioDiagnosticsMux);
+}
+
+void finishSpeechDiagnostic(bool ok, DiagnosticError error, int status, size_t bytes) {
+  portENTER_CRITICAL(&audioDiagnosticsMux);
+  audioDiagnostics.lastSpeechBytes = bytes;
+  const uint32_t byteCount = static_cast<uint32_t>(bytes);
+  audioDiagnostics.speechBytesReceived =
+      byteCount > UINT32_MAX - audioDiagnostics.speechBytesReceived
+          ? UINT32_MAX : audioDiagnostics.speechBytesReceived + byteCount;
+  audioDiagnostics.lastHttpStatus = status;
+  if (ok) {
+    ++audioDiagnostics.speechSuccesses;
+    audioDiagnostics.lastError = DiagnosticError::None;
+  } else {
+    if (error == DiagnosticError::QuietMode) ++audioDiagnostics.speechSkips;
+    else ++audioDiagnostics.speechFailures;
+    audioDiagnostics.lastError = error == DiagnosticError::None ? DiagnosticError::Unknown : error;
+  }
+  portEXIT_CRITICAL(&audioDiagnosticsMux);
+}
+
 bool codecWrite(uint8_t reg, uint8_t value) {
+  peripherals::Wire1Lock lock;
+  if (!lock) return false;
   Wire1.beginTransmission(kCodecAddress);
   Wire1.write(reg);
   Wire1.write(value);
@@ -140,6 +188,8 @@ bool codecWrite(uint8_t reg, uint8_t value) {
 }
 
 bool codecRead(uint8_t reg, uint8_t& value) {
+  peripherals::Wire1Lock lock;
+  if (!lock) return false;
   Wire1.beginTransmission(kCodecAddress);
   Wire1.write(reg);
   if (Wire1.endTransmission(false) != 0 || Wire1.requestFrom(kCodecAddress, uint8_t(1)) != 1) return false;
@@ -148,6 +198,8 @@ bool codecRead(uint8_t reg, uint8_t& value) {
 }
 
 bool codecSetMuted(bool muted) {
+  peripherals::Wire1Lock lock;
+  if (!lock) return false;
   // This read/modify/write matches Espressif's es8311_set_mute implementation.
   uint8_t value = 0;
   if (!codecRead(0x31, value)) {
@@ -164,6 +216,8 @@ bool codecSetMuted(bool muted) {
 }
 
 bool setExpanderP7(bool enabled) {
+  peripherals::Wire1Lock lock;
+  if (!lock) return false;
   uint8_t output = 0, config = 0;
   Wire1.beginTransmission(board::kExpanderAddress);
   Wire1.write(0x01);
@@ -244,6 +298,8 @@ bool writeAndVerifyDacGain(uint8_t gain, uint8_t* actualReadback = nullptr) {
 }
 
 bool enableOutput() {
+  peripherals::Wire1Lock lock;
+  if (!lock) return false;
   if (!codecSetMuted(false)) return false;
   if (!setExpanderP7(true)) {
     codecSetMuted(true);
@@ -257,10 +313,23 @@ bool disableOutput(bool drainTx) {
   // i2s_channel_write may return while samples still occupy the DMA ring.
   // Drain the configured six 240-frame descriptors (90 ms at 16 kHz) before muting.
   if (drainTx) vTaskDelay(pdMS_TO_TICKS(kTxDrainMs));
-  const bool muted = codecSetMuted(true);
-  const bool ampDisabled = setExpanderP7(false);
+  bool muted = false;
+  bool ampDisabled = false;
+  for (uint8_t attempt = 0; attempt < kOutputCleanupAttempts; ++attempt) {
+    {
+      peripherals::Wire1Lock lock(pdMS_TO_TICKS(kOutputCleanupLockWaitMs));
+      if (lock) {
+        muted = codecSetMuted(true);
+        ampDisabled = setExpanderP7(false);
+      }
+    }
+    if (muted && ampDisabled) return true;
+    if (attempt + 1 < kOutputCleanupAttempts) vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  // P7 LOW is the hardware-safe fallback even if codec mute readback failed.
   if (!ampDisabled) setDiagnosticError(DiagnosticError::AmpDisable);
-  return muted && ampDisabled;
+  else if (!muted) setDiagnosticError(DiagnosticError::CodecMute);
+  return false;
 }
 
 bool writeSamples(const int16_t* mono, size_t count, uint32_t timeoutMs) {
@@ -332,6 +401,19 @@ void V1Es8311::disable() {
   setExpanderP7(false);
 }
 
+void V1Es8311::setQuiet(bool quiet) {
+  portENTER_CRITICAL(&stateMux_);
+  quiet_ = quiet;
+  portEXIT_CRITICAL(&stateMux_);
+}
+
+bool V1Es8311::quiet() const {
+  portENTER_CRITICAL(&stateMux_);
+  const bool result = quiet_;
+  portEXIT_CRITICAL(&stateMux_);
+  return result;
+}
+
 bool V1Es8311::writeMonoSamples(const int16_t* samples, size_t count, uint32_t timeoutMs) {
   if (!ready_ || !samples || !count || !audioMutex) return false;
   if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
@@ -344,11 +426,18 @@ bool V1Es8311::writeMonoSamples(const int16_t* samples, size_t count, uint32_t t
 }
 
 bool V1Es8311::playMonoPcm(const int16_t* samples, size_t count) {
-  if (!ready_ || !samples || count == 0 || !claimPcm()) return false;
+  if (quiet()) { setDiagnosticError(DiagnosticError::QuietMode); return false; }
+  if (!ready_ || !samples || count == 0 || count > kMaxSpeechBytes / 2 || !claimPcm()) return false;
   const size_t firstCount = min(kMonoChunkSamples, count);
   if (!writeMonoSamples(samples, firstCount, 500)) {
     disableOutput(false);
     releasePcm();
+    return false;
+  }
+  if (quiet()) {
+    disableOutput(false);
+    releasePcm();
+    setDiagnosticError(DiagnosticError::QuietMode);
     return false;
   }
   if (!enableOutput()) {
@@ -356,11 +445,23 @@ bool V1Es8311::playMonoPcm(const int16_t* samples, size_t count) {
     releasePcm();
     return false;
   }
-  const bool ok = count == firstCount ||
-      writeMonoSamples(samples + firstCount, count - firstCount, 500);
-  disableOutput(true);
+  bool ok = true;
+  for (size_t offset = firstCount; offset < count;) {
+    if (quiet()) {
+      ok = false;
+      setDiagnosticError(DiagnosticError::QuietMode);
+      break;
+    }
+    const size_t n = min(kMonoChunkSamples, count - offset);
+    if (!writeMonoSamples(samples + offset, n, 500)) {
+      ok = false;
+      break;
+    }
+    offset += n;
+  }
+  const bool cleanupOk = disableOutput(true);
   releasePcm();
-  return ok;
+  return ok && cleanupOk;
 }
 
 bool V1Es8311::emitTone(uint16_t hz, uint16_t ms, bool& outputActive) {
@@ -368,6 +469,7 @@ bool V1Es8311::emitTone(uint16_t hz, uint16_t ms, bool& outputActive) {
   int16_t samples[kMonoChunkSamples];
   const uint32_t halfPeriod = max<uint32_t>(1, kSampleRate / (hz * 2));
   for (uint32_t done = 0; done < count;) {
+    if (quiet()) return false;
     const size_t n = min<uint32_t>(kMonoChunkSamples, count - done);
     for (size_t i = 0; i < n; ++i) {
       const uint32_t s = done + i;
@@ -391,6 +493,10 @@ bool V1Es8311::chirp(const char* kind) {
   beginChirpDiagnostic();
   if (!ready_) {
     setDiagnosticError(DiagnosticError::NotReady);
+    return false;
+  }
+  if (quiet()) {
+    skipChirpDiagnostic(DiagnosticError::QuietMode);
     return false;
   }
   if (!kind || !claimChirp()) {
@@ -496,13 +602,44 @@ void V1Es8311::releasePcm() {
 }
 
 bool V1Es8311::playUrl(const char* url) {
-  if (!ready_ || !url || !*url || WiFi.status() != WL_CONNECTED) return false;
-  if (!claimSpeech()) return false;
+  beginSpeechDiagnostic();
+  if (quiet()) {
+    finishSpeechDiagnostic(false, DiagnosticError::QuietMode, 0, 0);
+    return false;
+  }
+  if (!ready_) {
+    finishSpeechDiagnostic(false, DiagnosticError::NotReady, 0, 0);
+    return false;
+  }
+  if (!url || !*url || strlen(url) > kMaxSpeechUrlLength) {
+    finishSpeechDiagnostic(false, DiagnosticError::UrlRejected, 0, 0);
+    return false;
+  }
+  // Arduino-ESP32 HTTPClient's URL overload falls back to an insecure TLS
+  // transport when no CA is supplied. Keep playback on the local HTTP host
+  // contract until the project has a verified certificate path.
+  if (strncmp(url, "http://", 7)) {
+    finishSpeechDiagnostic(false, DiagnosticError::UrlRejected, 0, 0);
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    finishSpeechDiagnostic(false, DiagnosticError::WifiUnavailable, 0, 0);
+    return false;
+  }
+  if (!claimSpeech()) {
+    finishSpeechDiagnostic(false, DiagnosticError::Busy, 0, 0);
+    return false;
+  }
   String* pending = new (std::nothrow) String(url);
-  if (!pending) { releaseSpeech(); return false; }
+  if (!pending) {
+    releaseSpeech();
+    finishSpeechDiagnostic(false, DiagnosticError::TaskCreate, 0, 0);
+    return false;
+  }
   if (xTaskCreatePinnedToCore(urlTask, "audio-url", 4096, pending, 1, nullptr, 0) != pdPASS) {
     delete pending;
     releaseSpeech();
+    finishSpeechDiagnostic(false, DiagnosticError::TaskCreate, 0, 0);
     return false;
   }
   return true;
@@ -521,61 +658,116 @@ void V1Es8311::urlTask(void* context) {
 bool V1Es8311::playUrlWorker(const String& url) {
   HTTPClient http;
   http.setConnectTimeout(3000);
-  http.setTimeout(3000);
+  http.setTimeout(1000);
+  http.setReuse(false);
+  const char* responseHeaders[] = {"Transfer-Encoding", "Content-Encoding"};
+  http.collectHeaders(responseHeaders, 2);
   bool ok = false;
+  DiagnosticError failure = DiagnosticError::None;
+  int status = 0;
+  size_t received = 0;
+  const uint32_t started = millis();
   const bool begun = http.begin(url);
-  if (begun && http.GET() == 200) {
-    if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-      setDiagnosticError(DiagnosticError::OwnerTimeout);
-      http.end();
-      return false;
-    }
-    WiFiClient* stream = http.getStreamPtr();
-    const int total = http.getSize();
-    int received = 0;
-    uint32_t lastData = millis();
-    bool timedOut = false;
-    bool hasCarry = false;
-    bool outputActive = false;
-    uint8_t carry = 0;
-    int16_t samples[kMonoChunkSamples];
-    uint8_t raw[kMonoChunkSamples * sizeof(int16_t) + 1];
-    while (http.connected() && (total < 0 || received < total)) {
-      const size_t available = stream->available();
-      if (available >= sizeof(int16_t)) {
-        const size_t limit = kMonoChunkSamples * sizeof(int16_t) - (hasCarry ? 1 : 0);
-        const size_t want = min(available, limit);
-        size_t offset = 0;
-        if (hasCarry) { raw[0] = carry; offset = 1; }
-        const int bytes = stream->readBytes(raw + offset, want);
-        if (bytes <= 0) break;
-        received += bytes;
-        const size_t combined = offset + static_cast<size_t>(bytes);
-        const size_t evenBytes = combined & ~size_t(1);
-        if (evenBytes) {
-          memcpy(samples, raw, evenBytes);
-          if (!outputActive) {
-            // Queue one complete PCM chunk while the codec is muted and P7 is low.
-            if (!writeSamples(samples, evenBytes / sizeof(int16_t), 500)) break;
-            if (!enableOutput()) break;
-            outputActive = true;
-          } else if (!writeSamples(samples, evenBytes / sizeof(int16_t), 500)) {
-            break;
-          }
-        }
-        hasCarry = (combined != evenBytes);
-        if (hasCarry) carry = raw[combined - 1];
-        lastData = millis();
-      } else {
-        if (millis() - lastData >= 3000) { timedOut = true; break; }
-        vTaskDelay(pdMS_TO_TICKS(5));
+  if (!begun) {
+    failure = DiagnosticError::HttpBegin;
+  } else {
+    status = http.GET();
+    if (status != HTTP_CODE_OK) failure = DiagnosticError::HttpStatus;
+    else {
+      String transferEncoding = http.header("Transfer-Encoding");
+      transferEncoding.toLowerCase();
+      String contentEncoding = http.header("Content-Encoding");
+      contentEncoding.toLowerCase();
+      if ((!transferEncoding.isEmpty() && transferEncoding != "identity") ||
+          (!contentEncoding.isEmpty() && contentEncoding != "identity")) {
+        failure = DiagnosticError::HttpEncoding;
       }
     }
-    ok = !timedOut && !hasCarry && (total >= 0 ? received == total : !http.connected());
-    disableOutput(outputActive);
-    xSemaphoreGive(audioMutex);
+  }
+  if (begun && status == HTTP_CODE_OK) {
+    if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+      failure = DiagnosticError::OwnerTimeout;
+    } else {
+      WiFiClient* stream = http.getStreamPtr();
+      const int total = http.getSize();
+      uint32_t lastData = millis();
+      bool outputActive = false;
+      int16_t samples[kMonoChunkSamples];
+      uint8_t raw[kMonoChunkSamples * sizeof(int16_t)];
+      Pcm16LeDecoder decoder;
+      if (total > static_cast<int>(kMaxSpeechBytes)) failure = DiagnosticError::HttpTooLarge;
+      else if (total == 0) failure = DiagnosticError::PcmMalformed;
+      while (failure == DiagnosticError::None &&
+             http.connected() && (total < 0 || received < static_cast<size_t>(total))) {
+        if (quiet()) {
+          failure = DiagnosticError::QuietMode;
+          break;
+        }
+        if (millis() - started >= kMaxSpeechTaskMs) {
+          failure = DiagnosticError::HttpTimeout;
+          break;
+        }
+        const size_t available = stream->available();
+        if (available) {
+          const size_t want = min(available, sizeof(raw));
+          const int bytes = stream->readBytes(raw, want);
+          if (bytes <= 0) {
+            failure = DiagnosticError::HttpTimeout;
+            break;
+          }
+          received += static_cast<size_t>(bytes);
+          if (received > kMaxSpeechBytes) {
+            failure = DiagnosticError::HttpTooLarge;
+            break;
+          }
+          size_t sampleCount = 0;
+          if (!decoder.push(raw, static_cast<size_t>(bytes), samples, kMonoChunkSamples, sampleCount)) {
+            failure = DiagnosticError::PcmMalformed;
+            break;
+          }
+          if (sampleCount) {
+            if (!outputActive) {
+              // Queue one complete PCM chunk while muted and with P7 low.
+              if (!writeSamples(samples, sampleCount, 500)) {
+                failure = DiagnosticError::I2sWrite;
+                break;
+              }
+              if (!enableOutput()) {
+                failure = diagnostics().lastError;
+                break;
+              }
+              outputActive = true;
+            } else if (!writeSamples(samples, sampleCount, 500)) {
+              failure = DiagnosticError::I2sWrite;
+              break;
+            }
+          }
+          lastData = millis();
+        } else {
+          if (millis() - lastData >= 3000) {
+            failure = DiagnosticError::HttpTimeout;
+            break;
+          }
+          vTaskDelay(pdMS_TO_TICKS(5));
+        }
+      }
+      if (failure == DiagnosticError::None) {
+        if (!decoder.complete()) failure = DiagnosticError::PcmMalformed;
+        else if (!received) failure = DiagnosticError::PcmMalformed;
+        else if (total >= 0 && received != static_cast<size_t>(total)) failure = DiagnosticError::HttpTimeout;
+        else if (total < 0 && http.connected()) failure = DiagnosticError::HttpTimeout;
+        else ok = true;
+      }
+      if (!disableOutput(outputActive)) {
+        ok = false;
+        failure = diagnostics().lastError;
+        if (failure == DiagnosticError::None) failure = DiagnosticError::OutputCleanup;
+      }
+      xSemaphoreGive(audioMutex);
+    }
   }
   if (begun) http.end();
+  finishSpeechDiagnostic(ok, failure, status, received);
   return ok;
 }
 
