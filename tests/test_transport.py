@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from plugin import serial_link
 from plugin.serial_link import SerialLink
 
 TOKEN = "test-token-123"
@@ -92,6 +94,110 @@ def test_tcp_auth_roundtrip():
     assert seen[0] == {"cmd": "deck", "i": 0}
     s.close()
     assert wait_for(lambda: not link._net_clients)
+
+
+def test_tcp_malformed_frame_recovers_and_client_can_reconnect():
+    link, seen = make_link()
+    port = link.start_tcp(0, token=TOKEN)
+
+    first = tcp_connect(port)
+    first.sendall(json.dumps({"type": "auth", "token": TOKEN}).encode() + b"\n")
+    assert json.loads(readline(first)) == {"type": "auth", "ok": True}
+    assert wait_for(lambda: len(link._net_clients) == 1)
+    first.sendall(b'{"cmd":\nnot-json\n{"cmd":"deck","i":2}\n')
+    assert wait_for(lambda: seen == [{"cmd": "deck", "i": 2}])
+    first.close()
+    assert wait_for(lambda: not link._net_clients)
+
+    second = tcp_connect(port)
+    second.sendall(json.dumps({"type": "auth", "token": TOKEN}).encode() + b"\n")
+    assert json.loads(readline(second)) == {"type": "auth", "ok": True}
+    assert wait_for(lambda: len(link._net_clients) == 1)
+    second.sendall(b'{"cmd":"deck","i":3}\n')
+    assert wait_for(lambda: seen == [{"cmd": "deck", "i": 2}, {"cmd": "deck", "i": 3}])
+    second.close()
+    assert wait_for(lambda: not link._net_clients)
+
+
+def test_slow_network_sender_is_isolated_from_other_clients(monkeypatch):
+    monkeypatch.setattr(serial_link, "_NET_SEND_QUEUE_SIZE", 1)
+    link, _seen = make_link()
+    blocked = threading.Event()
+    release = threading.Event()
+    disconnected = threading.Event()
+    received = []
+
+    def slow_write(_data):
+        blocked.set()
+        release.wait(timeout=2)
+
+    slow = serial_link._queued_sender(slow_write, disconnected.set)
+    link._net_add("tcp", slow, "slow-peer")
+    link._net_add("tcp", received.append, "fast-peer")
+
+    link._net_send(b"first\n")
+    assert blocked.wait(timeout=1)
+    link._net_send(b"queued\n")
+    link._net_send(b"overflow\n")
+
+    assert disconnected.wait(timeout=1)
+    assert received == [b"first\n", b"queued\n", b"overflow\n"]
+    assert wait_for(lambda: link.peers() == [("tcp", "fast-peer")])
+    release.set()
+
+
+def test_failed_network_write_removes_peer_and_keeps_broadcasting():
+    link, _seen = make_link()
+    received = []
+
+    def broken_write(_data):
+        raise OSError("peer disconnected")
+
+    broken = serial_link._queued_sender(broken_write, lambda: None, link._net_del)
+    link._net_add("tcp", broken, "broken-peer")
+    link._net_add("tcp", received.append, "healthy-peer")
+
+    link._net_send(b"fails asynchronously\n")
+    assert wait_for(lambda: link.peers() == [("tcp", "healthy-peer")])
+    link._net_send(b"still delivered\n")
+
+    assert received == [b"fails asynchronously\n", b"still delivered\n"]
+
+
+def test_slow_disconnect_does_not_block_broadcast(monkeypatch):
+    monkeypatch.setattr(serial_link, "_NET_SEND_QUEUE_SIZE", 1)
+    link, _seen = make_link()
+    blocked = threading.Event()
+    release_write = threading.Event()
+    disconnect_entered = threading.Event()
+    release_disconnect = threading.Event()
+    received = []
+
+    def slow_write(_data):
+        blocked.set()
+        release_write.wait(timeout=2)
+
+    def slow_disconnect():
+        disconnect_entered.set()
+        release_disconnect.wait(timeout=2)
+
+    slow = serial_link._queued_sender(slow_write, slow_disconnect, link._net_del)
+    link._net_add("tcp", slow, "slow-peer")
+    link._net_add("tcp", received.append, "fast-peer")
+    link._net_send(b"first\n")
+    assert blocked.wait(timeout=1)
+    link._net_send(b"queued\n")
+
+    started = time.monotonic()
+    link._net_send(b"overflow\n")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert disconnect_entered.wait(timeout=1)
+    assert received == [b"first\n", b"queued\n", b"overflow\n"]
+    assert wait_for(lambda: link.peers() == [("tcp", "fast-peer")])
+    release_write.set()
+    release_disconnect.set()
 
 
 def test_welcome_snapshot_on_connect():

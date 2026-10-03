@@ -41,6 +41,65 @@ _RESCAN_SECS = 3.0
 # after this many consecutive failed scan rounds with a port present, try it.
 _UNWEDGE_AFTER_FAILS = 8
 _UNWEDGE_COOLDOWN = 300.0
+_NET_SEND_QUEUE_SIZE = 64
+
+
+def _queued_sender(write, disconnect, on_close=None):
+    """Keep a slow network peer from blocking the shared link thread.
+
+    A full queue means the peer cannot keep up. Drop that peer instead of
+    dropping protocol frames or delaying writes to the other clients.
+    """
+    pending: queue.Queue[bytes] = queue.Queue(maxsize=_NET_SEND_QUEUE_SIZE)
+    closed = threading.Event()
+    close_lock = threading.Lock()
+
+    def fail_peer() -> None:
+        with close_lock:
+            if closed.is_set():
+                return
+            closed.set()
+        if on_close:
+            try:
+                on_close(sender)
+            except Exception:
+                pass
+
+        def close_connection():
+            try:
+                disconnect()
+            except Exception:
+                pass
+
+        # Socket shutdown / WebSocket close may wait for peer I/O. Never run
+        # it in the shared broadcaster or the send worker.
+        threading.Thread(target=close_connection,
+                         name="familiar-net-close", daemon=True).start()
+
+    def pump():
+        while not closed.is_set():
+            try:
+                data = pending.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                write(data)
+            except Exception:
+                fail_peer()
+                return
+
+    def sender(data: bytes) -> None:
+        if closed.is_set():
+            raise ConnectionError("network client is closed")
+        try:
+            pending.put_nowait(data)
+        except queue.Full:
+            fail_peer()
+            raise ConnectionError("network client send queue is full")
+
+    sender.close = closed.set
+    threading.Thread(target=pump, name="familiar-net-send", daemon=True).start()
+    return sender
 
 
 def _find_esptool() -> str | None:
@@ -141,6 +200,9 @@ class SerialLink:
     def _net_del(self, sender) -> None:
         with self._net_lock:
             self._net_clients = [c for c in self._net_clients if c[1] is not sender]
+        close = getattr(sender, "close", None)
+        if close:
+            close()
 
     def peers(self) -> list:
         """[(kind, peer), …] for connected network surfaces."""
@@ -169,9 +231,17 @@ class SerialLink:
                     return
                 w = self.wfile
 
-                def sender(data: bytes) -> None:
+                def write(data: bytes) -> None:
                     w.write(data)
                     w.flush()
+
+                def disconnect() -> None:
+                    try:
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+                sender = _queued_sender(write, disconnect, link._net_del)
 
                 if token:
                     sender(b'{"type":"auth","ok":true}\n')
@@ -236,8 +306,13 @@ class SerialLink:
                 except Exception:
                     return
 
-            def sender(data: bytes) -> None:
+            def write(data: bytes) -> None:
                 conn.send(data.decode("utf-8"))
+
+            def disconnect() -> None:
+                conn.close()
+
+            sender = _queued_sender(write, disconnect, link._net_del)
 
             link._net_add("ws", sender, peer)
             link._send_welcome(sender)
