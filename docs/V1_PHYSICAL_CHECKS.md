@@ -2,15 +2,19 @@
 
 The host sensor test checks the detector against controlled acceleration samples. This board check separately records gestures emitted by the running firmware; it does not treat an operator confirmation as evidence.
 
-## Current priority: identify the unexpected restarts
+## Current priority: resolve the silent serial capture
 
-The latest 900-second capture on `627c9dd` recorded three restarts, but its JSON-only log discarded boot text, so their cause is unknown. The user confirmed no cable or button handling during that capture. The current firmware exposes `reset_reason` and `reset_reason_code` in hello/diag; its `usb` / code 11 value immediately after upload matches the explicit esptool RTS reset and does not explain those earlier restarts. A subsequent 15-second capture saw no further restart. Await confirmation whether the planned gentle screen-up/screen-down flip was performed. For the next capture, keep USB physically stable and leave the board buttons untouched while recording the raw USB serial output. Save the raw byte stream (`.bin`) and timestamped JSONL sidecar as private evidence outside the checkout:
+The earlier 900-second capture on `627c9dd` recorded three restarts whose cause remains unknown; its JSON-only log discarded boot text. A later operator-confirmed gentle flip kept the display on, and touch changed pages, but the face appeared static. Its 180-second raw capture (`gentle-flip-0ea8187-01`) saved 5,577 bytes, all received by 0.151 s. The initial pickup event at 0.0025 s may have been buffered before capture. Two diagnostics reported uptime 1,867,537/1,867,553 ms and `reset_reason=usb` / code 11 from the same boot, with IMU errors at zero and screen-up +Z values. No disconnect or uptime rollback was observed, but the lack of later USB receive means this is not evidence of sustained uptime or a completed gesture check. The initial writer sent unknown `cmd=diag` before correction to `touchdiag`; neither the later probe sequence nor a separate 15-second reopen capture received replies. No reset or reflash occurred during this continuation.
+
+The capture utility opens a raw tty and makes no explicit DTR/RTS ioctl. This firmware selects Arduino `HWCDC` USB Serial/JTAG; inspection of the selected core path found no DTR-triggered reset handling. That does not explain the missing later bytes, and no tool defect has been demonstrated. Physical checks are paused while the operator is away. Resume with one controlled serial session before any further flips: close other port users, start one reader, then send a single `ping` and one `touchdiag`, keeping USB stable and buttons untouched. Save raw bytes and the timestamped JSONL sidecar outside the checkout. Do not change gesture thresholds or claim the older restarts are explained.
+
+The firmware reports the immutable `reset_reason` and `reset_reason_code` in hello/diag. Its `usb` / code 11 value matches the explicit esptool RTS reset used for upload; it does not explain the three older restarts. The files `gentle-flip-0ea8187-01.bin` / `.jsonl`, `gentle-flip-0ea8187-reopen.bin` / `.jsonl`, and `gentle-flip-summary.json` are private evidence under `~/.local/state/espherm/2026-10-03/`.
 
 ```sh
-python3 scripts/capture_v1_usb_raw.py --port /dev/ttyACM0 --duration 120 --probe --output ~/.local/state/espherm/2026-10-03/v1-usb-reset-120s
+python3 scripts/capture_v1_usb_raw.py --port /dev/ttyACM0 --duration 120 --probe --output ~/.local/state/espherm/2026-10-03/v1-usb-controlled-01
 ```
 
-`--probe` sends familiar-safe `ping` and `touchdiag` requests once per connection so the sidecar can include hello/diag reset-reason fields; the raw byte stream remains authoritative. The default mode sends no serial writes, and neither mode makes DTR/RTS ioctls. Opening the tty through the OS/driver may still affect modem signals. Do not change gesture thresholds or initiate a reboot for this capture. Do not use the gesture script for this step: it clears the serial input buffer and only saves parsed JSON lines.
+The capture tool refuses to overwrite existing output files; choose a new base name for each run. `--probe` sends familiar-safe `ping` and `touchdiag` requests once per connection so the sidecar can include hello/diag reset-reason fields; the raw byte stream remains authoritative. The default mode sends no serial writes, and neither mode makes DTR/RTS ioctls. Opening the tty through the OS/driver may still affect modem signals. Do not change gesture thresholds or initiate a reboot for this capture. Do not use the gesture script for this step: it clears the serial input buffer and only saves parsed JSON lines.
 
 ## Gesture sequence
 
