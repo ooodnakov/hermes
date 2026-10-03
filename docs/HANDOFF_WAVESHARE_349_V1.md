@@ -2,11 +2,20 @@
 
 Current as of 2026-10-03, including the continuation evidence below. Read this before continuing in a new chat; the latest continuation evidence supersedes earlier subsystem status and older progress snapshots in the migration plan where they disagree.
 
+## Current resume snapshot
+
+- Branch `board/esp32-s3-lcd-349-v1` is pushed at the `627c9dd` firmware source checkpoint. A later docs-only commit may change branch HEAD; the flashed image remains built from `627c9dd`. Its app SHA-256 is `12d9a7b5a6a4568b06c7ffe2eadad49fd1d418237bccedd10138a18f08ed7e3a` (2,872,912 bytes); RAM usage is 67,096 / 327,680 and flash usage is 2,872,515 / 13,631,488 bytes. The local, clean-clone, and CI application binaries are byte-identical. CI runs `37121792300` (`c1965c6`) and `37123537892` (`627c9dd`) both succeeded; each covered all three firmware environments, 90 host tests, 13 subtests, and artifact hash checks.
+- Latest local bundle: `dist/waveshare-349-v1-627c9dd/`. The user confirmed the text changes look okay and the STATS spacing fix is good.
+- The 900-second read-only capture finished with 7,471 rows but did not complete gesture verification: face-down/quiet-true observations occurred at 225.807 s and 302.893 s; no upright, tap 2, shake, or pickup event was recorded. Three restarts occurred at capture elapsed times 219.508 s (uptime 383530→810 ms), 241.406 s (20717→808 ms), and 418.463 s (171941→809 ms). Their cause is unknown. Only JSON diagnostics and gesture events were logged; boot text was discarded, so the capture cannot distinguish a physical reset/button event from a firmware fault. The user was asked about USB/button handling and has not answered; do not infer a cause.
+- At the stop, `fuser` reported no owner for `/dev/ttyACM0`; no runtime capture is active. Next, capture raw USB boot output and identify the reset reason during a gentle flip, keeping USB stable and buttons untouched. Do that before changing gesture thresholds or repeating calibration. Do not redo completed bring-up or reflash without a code change.
+- Private evidence is under `~/.local/state/espherm/2026-10-03/` and stays outside Git. Continue using Luna for implementation; `rtk` is unnecessary. The user authorized pushing to the fork. HTTPS GitHub auth lacks workflow scope; use the working SSH remote form `ssh://git@github.com/ooodnakov/hermes.git`, and never force-push.
+- T35 is complete. T36, T37, and T38 remain partial; the migration is not complete.
+
 ## Checkout and user preferences
 
 - Checkout: `/home/user/Projects/espherm`, branch `board/esp32-s3-lcd-349-v1`, based on Hermes commit `9d69262`.
 - `origin` is the user's fork `ooodnakov/hermes`; `upstream` is `webdevtodayjason/hermes`.
-- Work is committed locally: `d93cb31` preserves the initial migration, `ad5cc78` fixes stale touch state after read errors, and `9241344` hardens USB framing. Subsequent checkpoints include SD provisioning/runtime evidence, `7098aeb` UI regressions, `29a9380` RTC sync/sensor diagnostics, and `891b7ae` RTC sample-age diagnostics. Nothing has been pushed; there is no PR. Commits used command-local Codex author identity because Git user identity was unset.
+- Work is on `board/esp32-s3-lcd-349-v1`; earlier checkpoints include `d93cb31`, `ad5cc78`, `9241344`, `7098aeb`, `29a9380`, and `891b7ae`. Commits `c1965c6`, `672dc43`, and `627c9dd` are pushed to `origin`; CI runs `37121792300` and `37123537892` passed for `c1965c6` and `627c9dd`, respectively. The `627c9dd` image is flashed and hash-verified as recorded below. Commits used command-local Codex author identity because Git user identity was unset.
 - The user asked that implementation work be delegated to Luna subagents to conserve limits. Do not take over coding in the root chat; use Luna for implementation and keep status reports concise. The user explicitly said `rtk` is unnecessary.
 - The user reported that the new portrait/avatar is visible and animated, and later that touch “seems to work.” Treat touch as promising but incompletely calibrated; no full corner matrix or extended test was recorded.
 
@@ -110,3 +119,25 @@ The detailed 38-task backlog is in [MIGRATION_ESP32_S3_TOUCH_LCD_349_V1.md](MIGR
 - Live protocol fault checks on the earlier flashed image (`84b24c20c1edbd93bf2e16c09c154dae78bf19140dc9619e0f9c792bb125f365`) rejected oversized and NUL-containing USB lines, then recovered to subsequent valid traffic. Invalid HTTPS speech URLs and a refused loopback HTTP request were handled without resetting the display or SD subsystem. These checks predate the final stats reflash and do not establish cloud TTS service success or audible speech.
 - The local V1 release bundle was assembled from the final flashed application artifact and regenerated checked-in artwork. It includes firmware components, SD assets, package hashes and source/toolchain metadata; direct standalone flashing of the package components was not exercised. See [RELEASE_349_V1.md](RELEASE_349_V1.md) for package structure and board upload notes.
 - Final host validation passed 90 tests and 13 pytest subtests, including four packaging checks. The clean source snapshot previously passed 86 tests and 13 subtests alongside all three firmware builds. Read-only gesture capture has observed face-down quiet-on and upright quiet-off states; double-tap remains under observation and is not signed off.
+
+## Publication and gesture follow-up (2026-10-03)
+
+- The verified source checkpoint was published to the user's fork at `c1965c6909aa21a0b7a49ddda759d7b653c60425`. GitHub Actions run `37121792300` is in progress; do not record CI as passed until its result is confirmed.
+- The release bundle was regenerated at `dist/waveshare-349-v1-c1965c6/` with that commit and final flashed firmware SHA `af0eebadd45c6f4b65b0b01a4ab7a68266cf82e2c83d4c3bf9c00c19c4dd3015`. Its manifest shows one untracked local item at packaging time; generated bundle files are ignored by Git.
+- A 180-second read-only gesture capture ended while waiting for the user-requested double tap. This was a capture timeout, not a detector failure. Face-down quiet-on and upright quiet-off were observed; a resumed capture is waiting for double-tap, then shake/pickup. Do not treat gesture checks as complete until those observations are recorded.
+
+## Reproducible build and short-gesture continuation (2026-10-03)
+
+- GitHub Actions run `37121792300` for published commit `c1965c6` completed successfully: all three firmware environments and the 90-test, 13-subtest host suite passed; artifacts and hashes were verified.
+- Follow-up commits `672dc43` and `627c9dd` are on this branch. `672dc43` samples IMU gestures at 20 ms and uses elapsed-time settle guards (3 s / 1.5 s / 0.9 s); regressions reproduce the previous 300 ms scheduler missing short tap pulses. `627c9dd` uses dynamic source-prefix maps and source-commit `SOURCE_DATE_EPOCH`; it adds the `ESPHERM_BUILD_EPOCH` define from the commit timestamp to invalidate SCons build signatures when the source commit changes.
+- All three environments built from a clean Git clone at `627c9dd`. The local and clean-clone V1 application binaries match: SHA-256 `12d9a7b5a6a4568b06c7ffe2eadad49fd1d418237bccedd10138a18f08ed7e3a`, 2,872,912 bytes; RAM 67,096 / 327,680 and flash 2,872,515 / 13,631,488 bytes. A parallel build once hit an esptool image-conversion alias conflict; the sequential V1 rerun passed, so this was not a firmware compile failure.
+- At this checkpoint the branch push and flash of `627c9dd` were pending; the later verification and current gesture capture status are recorded below. The existing bundle `dist/waveshare-349-v1-c1965c6/` targets the earlier image and must not be used to identify the `627c9dd` firmware.
+- The recorded face-down/upright quiet-state observations and the timed-out capture predate the short-gesture firmware. They do not validate gesture detection on `627c9dd`.
+
+## Short-gesture image verification (2026-10-03)
+
+- Commit `627c9dd` is pushed to the fork branch and flashed. Esptool verified SHA-256 `12d9a7b5a6a4568b06c7ffe2eadad49fd1d418237bccedd10138a18f08ed7e3a` in 38.839 seconds. The application is 2,872,912 bytes; V1 RAM/flash usage is 67,096 / 327,680 and 2,872,515 / 13,631,488 bytes.
+- All three PlatformIO environments passed locally and from a clean Git clone. With `SOURCE_DATE_EPOCH` set from commit `627c9dd`, local and clone V1 application binaries were byte-identical (`cmp` exit 0) at the hash above. The 90-test, 13-subtest host suite passed after all changes.
+- CI run `37123537892` for `627c9dd` succeeded; all three artifacts and their SHA-256 files were verified. The V1 CI image exactly matches the local and flashed image hash `12d9a7b5a6a4568b06c7ffe2eadad49fd1d418237bccedd10138a18f08ed7e3a`.
+- The regenerated local release bundle at `dist/waveshare-349-v1-627c9dd/` contains 27 files and 20 raw4 frames; its V1 application hash matches the flashed image.
+- The resumed gesture/raw-diagnostic capture later finished; its current results and next step are recorded in the resume snapshot above.
