@@ -84,6 +84,34 @@ uint32_t touchGestureCount = 0;
 uint32_t lastGestureSequence = 0;
 bool quietMode = false;
 
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_watchdog";
+    case ESP_RST_TASK_WDT: return "task_watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    case ESP_RST_USB: return "usb";
+    case ESP_RST_JTAG: return "jtag";
+    case ESP_RST_EFUSE: return "efuse";
+    case ESP_RST_PWR_GLITCH: return "power_glitch";
+    case ESP_RST_CPU_LOCKUP: return "cpu_lockup";
+    default: return "unknown";
+  }
+}
+
+esp_reset_reason_t startupResetReason() {
+  // Capture once on first hello during setup; later diagnostics use the same
+  // immutable reason for the boot that produced this running firmware.
+  static const esp_reset_reason_t reason = esp_reset_reason();
+  return reason;
+}
+
 bool readExpander(uint8_t reg, uint8_t& value) {
   Wire1.beginTransmission(board::kExpanderAddress);
   Wire1.write(reg);
@@ -130,6 +158,9 @@ void sendHello(const char* transport) {
   hello["transport"] = transport;
   hello["board"] = board::kId;
   hello["firmware"] = "familiar-v1";
+  const esp_reset_reason_t resetReason = startupResetReason();
+  hello["reset_reason"] = resetReasonName(resetReason);
+  hello["reset_reason_code"] = static_cast<int>(resetReason);
   sendJson(hello);
 }
 
@@ -142,6 +173,9 @@ void sendDiagnostic() {
   diagnostic["board"] = board::kId;
   diagnostic["firmware"] = "familiar-v1";
   diagnostic["framework"] = ESP_ARDUINO_VERSION_STR;
+  const esp_reset_reason_t resetReason = startupResetReason();
+  diagnostic["reset_reason"] = resetReasonName(resetReason);
+  diagnostic["reset_reason_code"] = static_cast<int>(resetReason);
   diagnostic["display_ready"] = displayReady;
   diagnostic["canvas_ready"] = canvasReady;
   diagnostic["canvas_psram"] = canvas.getBuffer() && esp_ptr_external_ram(canvas.getBuffer());

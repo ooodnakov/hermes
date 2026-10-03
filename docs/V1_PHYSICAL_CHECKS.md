@@ -2,7 +2,19 @@
 
 The host sensor test checks the detector against controlled acceleration samples. This board check separately records gestures emitted by the running firmware; it does not treat an operator confirmation as evidence.
 
-Connect the board over USB, confirm its normal image is running, and close any serial monitor or bridge that has the port open. Reboot the board while it is screen-up and still so the sensor learns that orientation as its resting baseline. Install `pyserial` if needed, then run:
+## Current priority: identify the unexpected restarts
+
+The latest 900-second capture on `627c9dd` recorded three restarts, but its JSON-only log discarded boot text, so their cause is unknown. The user confirmed no cable or button handling during that capture. The current firmware exposes `reset_reason` and `reset_reason_code` in hello/diag; its `usb` / code 11 value immediately after upload matches the explicit esptool RTS reset and does not explain those earlier restarts. A subsequent 15-second capture saw no further restart. Await confirmation whether the planned gentle screen-up/screen-down flip was performed. For the next capture, keep USB physically stable and leave the board buttons untouched while recording the raw USB serial output. Save the raw byte stream (`.bin`) and timestamped JSONL sidecar as private evidence outside the checkout:
+
+```sh
+python3 scripts/capture_v1_usb_raw.py --port /dev/ttyACM0 --duration 120 --probe --output ~/.local/state/espherm/2026-10-03/v1-usb-reset-120s
+```
+
+`--probe` sends familiar-safe `ping` and `touchdiag` requests once per connection so the sidecar can include hello/diag reset-reason fields; the raw byte stream remains authoritative. The default mode sends no serial writes, and neither mode makes DTR/RTS ioctls. Opening the tty through the OS/driver may still affect modem signals. Do not change gesture thresholds or initiate a reboot for this capture. Do not use the gesture script for this step: it clears the serial input buffer and only saves parsed JSON lines.
+
+## Gesture sequence
+
+After the reset cause has been identified, connect the board over USB, confirm its normal image is running, and close any serial monitor or bridge that has the port open. For a separate gesture run, start with the device screen-up and stationary so startup calibration can learn that resting orientation. Install `pyserial` if needed, then run:
 
 ```sh
 python3 scripts/check_v1_gestures.py --port /dev/ttyACM0
