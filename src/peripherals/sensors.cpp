@@ -22,8 +22,11 @@ constexpr uint8_t kQmiResetComplete = 0x80;
 constexpr uint32_t kQmiResetTimeoutMs = 2000;
 constexpr uint32_t kBatteryIntervalMs = 1000;
 constexpr uint32_t kRtcIntervalMs = 1000;
-constexpr uint32_t kImuIntervalMs = 300;
+constexpr uint32_t kImuIntervalMs = 20;
 constexpr uint32_t kImuRecoveryIntervalMs = 5000;
+constexpr uint32_t kBaseSettleMs = 3000;
+constexpr uint32_t kFaceDownSettleMs = 1500;
+constexpr uint32_t kUprightSettleMs = 900;
 
 bool validBcd(uint8_t value, uint8_t max) {
   const uint8_t low = value & 0x0f;
@@ -356,8 +359,8 @@ void Sensors::sampleImu(uint32_t nowMs) {
     lastMotionMs_ = nowMs;
     // Keep a previously learned resting attitude through a transient outage.
     // If still learning, discard only that incomplete qualification run.
-    if (!baseSet_) basePolls_ = 0;
-    faceDownPolls_ = uprightPolls_ = 0;
+    if (!baseSet_) baseStableTiming_ = false;
+    faceDownTiming_ = uprightTiming_ = false;
     if (consecutiveImuErrors_ != UINT8_MAX) ++consecutiveImuErrors_;
     incrementSaturated(state_.imuErrors);
     return;
@@ -396,12 +399,16 @@ void Sensors::detectGesture(uint32_t nowMs) {
 
   if (!baseSet_) {
     if (delta < 0.10f && magnitude > 0.5f) {
-      if (++basePolls_ >= 10) {
+      if (!baseStableTiming_) {
+        baseStableSinceMs_ = nowMs;
+        baseStableTiming_ = true;
+      }
+      if (nowMs - baseStableSinceMs_ >= kBaseSettleMs) {
         baseX_ = x; baseY_ = y; baseZ_ = z;
         baseSet_ = true;
       }
     } else {
-      basePolls_ = 0;
+      baseStableTiming_ = false;
     }
     if (!baseSet_ && nowMs - imuStartedMs_ > 60000 && magnitude > 0.5f) {
       baseX_ = x; baseY_ = y; baseZ_ = z;
@@ -415,13 +422,27 @@ void Sensors::detectGesture(uint32_t nowMs) {
     if (baseMagnitude > 0.15f && magnitude > 0.15f)
       dot = (x * baseX_ + y * baseY_ + z * baseZ_) / (baseMagnitude * magnitude);
   }
-  if (dot < -0.35f) { uprightPolls_ = 0; if (faceDownPolls_ < 250) ++faceDownPolls_; }
-  else if (dot > 0.2f) { faceDownPolls_ = 0; if (uprightPolls_ < 250) ++uprightPolls_; }
-  else { faceDownPolls_ = 0; uprightPolls_ = 0; }
-  if (!quietMode_ && faceDownPolls_ == 5) {
+  if (dot < -0.35f) {
+    uprightTiming_ = false;
+    if (!faceDownTiming_) {
+      faceDownSinceMs_ = nowMs;
+      faceDownTiming_ = true;
+    }
+  } else if (dot > 0.2f) {
+    faceDownTiming_ = false;
+    if (!uprightTiming_) {
+      uprightSinceMs_ = nowMs;
+      uprightTiming_ = true;
+    }
+  } else {
+    faceDownTiming_ = uprightTiming_ = false;
+  }
+  if (!quietMode_ && faceDownTiming_ &&
+      nowMs - faceDownSinceMs_ >= kFaceDownSettleMs) {
     quietMode_ = true;
     emitGesture(Gesture::FaceDown);
-  } else if (quietMode_ && uprightPolls_ == 3) {
+  } else if (quietMode_ && uprightTiming_ &&
+             nowMs - uprightSinceMs_ >= kUprightSettleMs) {
     quietMode_ = false;
     emitGesture(Gesture::Upright);
   }

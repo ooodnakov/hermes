@@ -211,37 +211,125 @@ void testLearnedOrientationGesturesAndShake() {
   setAccel(bus, 0, 0, 8192);
   peripherals::Sensors sensors;
   sensors.begin(bus, 0);
-  for (uint32_t now = 300; now <= 3000; now += 300) sensors.update(now);
+  for (uint32_t now = 300; now <= 3300; now += 300) sensors.update(now);
 
   setAccel(bus, 0, 0, -8192);
-  for (uint32_t now = 3300; now <= 4500; now += 300) sensors.update(now);
+  for (uint32_t now = 3600; now <= 5100; now += 300) sensors.update(now);
   assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
   const uint32_t faceDownSequence = sensors.snapshot().gestureSequence;
   assert(faceDownSequence == 1);
 
   setAccel(bus, 0, 0, 8192);
-  for (uint32_t now = 4800; now <= 5400; now += 300) sensors.update(now);
+  for (uint32_t now = 5400; now <= 6300; now += 300) sensors.update(now);
   assert(sensors.snapshot().gesture == peripherals::Gesture::Upright);
   assert(sensors.snapshot().gestureSequence == faceDownSequence + 1);
 
   setAccel(bus, 0, 0, 16384);
-  sensors.update(5700);
+  sensors.update(6600);
   assert(sensors.snapshot().gesture == peripherals::Gesture::Shake);
   assert(sensors.snapshot().gestureSequence == faceDownSequence + 2);
 
   setAccel(bus, 0, 0, 8192);
-  sensors.update(6000);
+  sensors.update(6900);
   setAccel(bus, 0, 0, 10240);
-  sensors.update(8100);
+  sensors.update(9000);
   setAccel(bus, 0, 0, 8192);
-  sensors.update(8400);
+  sensors.update(9300);
   assert(sensors.snapshot().gesture != peripherals::Gesture::Tap2);  // One knock plus its return edge.
   setAccel(bus, 0, 0, 10240);
-  sensors.update(8700);
+  sensors.update(9600);
   setAccel(bus, 0, 0, 8192);
-  sensors.update(9000);
+  sensors.update(9900);
   assert(sensors.snapshot().gesture == peripherals::Gesture::Tap2);
   assert(sensors.snapshot().gestureSequence == faceDownSequence + 3);
+}
+
+void testShortKnockPulsesBetweenLegacyPollsAndNoReturnEdgeDoubleCount() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  for (uint32_t now = 20; now <= 3020; now += 20) sensors.update(now);
+  assert(sensors.snapshot().gestureSequence == 0);
+
+  // Both 20ms pulses fall wholly between the former 300ms poll times
+  // (3000/3300 and 3600/3900), so the previous scheduler could not see them.
+  for (uint32_t now = 3040; now < 3100; now += 20) sensors.update(now);
+  setAccel(bus, 0, 0, 10650);
+  sensors.update(3100);
+  setAccel(bus, 0, 0, 8192);
+  sensors.update(3120);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::None);
+  assert(sensors.snapshot().gestureSequence == 0);
+
+  for (uint32_t now = 3140; now < 3700; now += 20) sensors.update(now);
+  setAccel(bus, 0, 0, 10650);
+  sensors.update(3700);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Tap2);
+  assert(sensors.snapshot().gestureSequence == 1);
+  setAccel(bus, 0, 0, 8192);
+  sensors.update(3720);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Tap2);
+  assert(sensors.snapshot().gestureSequence == 1);  // Falling edge is not another knock.
+}
+
+void testQualificationDurationsAndMillisWrap() {
+  constexpr uint32_t start = 0xfffff000u;
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, start);
+  for (uint32_t elapsed = 20; elapsed <= 3020; elapsed += 20)
+    sensors.update(start + elapsed);
+  assert(sensors.snapshot().gestureSequence == 0);
+
+  setAccel(bus, 0, 0, -8192);
+  sensors.update(start + 3040);
+  for (uint32_t elapsed = 3060; elapsed < 4520; elapsed += 20)
+    sensors.update(start + elapsed);
+  assert(sensors.snapshot().gestureSequence == 0);  // 1480ms is short of face-down qualification.
+  sensors.update(start + 4540);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
+  assert(sensors.snapshot().gestureSequence == 1);
+
+  setAccel(bus, 0, 0, 8192);
+  for (uint32_t elapsed = 4560; elapsed < 5440; elapsed += 20)
+    sensors.update(start + elapsed);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
+  assert(sensors.snapshot().gestureSequence == 1);  // 880ms is short of upright qualification.
+  sensors.update(start + 5460);
+  assert(sensors.snapshot().gesture == peripherals::Gesture::Upright);
+  assert(sensors.snapshot().gestureSequence == 2);
+}
+
+void testBaseQualificationRestartsAfterDisturbance() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  for (uint32_t now = 20; now <= 2980; now += 20) sensors.update(now);
+
+  // A magnitude disturbance just before the 3s mark invalidates that run.
+  setAccel(bus, 0, 0, 10650);
+  sensors.update(3000);
+  setAccel(bus, 0, 0, 8192);
+  sensors.update(3020);
+  for (uint32_t now = 3040; now < 3500; now += 20) sensors.update(now);
+
+  // Tilt before a fresh 3s stable baseline has elapsed. An early poll-count
+  // calibration would already be set and would incorrectly emit FaceDown.
+  setAccel(bus, 0, 0, -8192);
+  for (uint32_t now = 3500; now <= 5000; now += 20) sensors.update(now);
+  assert(sensors.snapshot().gestureSequence == 0);
 }
 
 void testImuOutageCancelsTapAndReanchorsMotion() {
@@ -252,16 +340,16 @@ void testImuOutageCancelsTapAndReanchorsMotion() {
   setAccel(bus, 0, 0, 8192);
   peripherals::Sensors sensors;
   sensors.begin(bus, 0);
-  for (uint32_t now = 300; now <= 3000; now += 300) sensors.update(now);
+  for (uint32_t now = 300; now <= 3300; now += 300) sensors.update(now);
   setAccel(bus, 0, 0, 10240);
-  sensors.update(3300);  // First half of a real tap pair.
-  bus.failTransaction = bus.transactionCount + 3;  // RTC control and calendar reads precede the IMU burst.
-  sensors.update(3600);  // Drop the IMU burst.
+  sensors.update(3600);  // First half of a real tap pair.
+  bus.failTransaction = bus.transactionCount + 1;  // Only the IMU burst is due at this update.
+  sensors.update(3900);  // Drop the IMU burst.
   assert(!sensors.snapshot().accelerationReady);
   setAccel(bus, 0, 0, 16384);
-  sensors.update(3900);  // Discontinuous post-outage sample is only an anchor.
+  sensors.update(4200);  // Discontinuous post-outage sample is only an anchor.
   assert(sensors.snapshot().gesture == peripherals::Gesture::None);
-  sensors.update(4200);
+  sensors.update(4500);
   assert(sensors.snapshot().gesture == peripherals::Gesture::None);
 }
 
@@ -288,21 +376,21 @@ void testImuOutagePreservesLearnedOrientationAndQuietRecovery() {
   setAccel(bus, 0, 0, 8192);
   peripherals::Sensors sensors;
   sensors.begin(bus, 0);
-  for (uint32_t now = 300; now <= 3000; now += 300) sensors.update(now);
+  for (uint32_t now = 300; now <= 3300; now += 300) sensors.update(now);
 
   setAccel(bus, 0, 0, -8192);
-  for (uint32_t now = 3300; now <= 4500; now += 300) sensors.update(now);
+  for (uint32_t now = 3600; now <= 5100; now += 300) sensors.update(now);
   assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
 
-  bus.failTransaction = bus.transactionCount + 3;  // RTC control/calendar reads precede the IMU burst.
-  sensors.update(4800);
+  bus.failTransaction = bus.transactionCount + 1;  // Only the IMU burst is due at this update.
+  sensors.update(5400);
   assert(!sensors.snapshot().accelerationReady);
-  sensors.update(5100);  // First recovered sample reanchors magnitude only.
-  for (uint32_t now = 5400; now <= 6600; now += 300) sensors.update(now);
+  sensors.update(5700);  // First recovered sample reanchors magnitude only.
+  for (uint32_t now = 6000; now <= 7200; now += 300) sensors.update(now);
   assert(sensors.snapshot().gesture == peripherals::Gesture::FaceDown);
 
   setAccel(bus, 0, 0, 8192);
-  for (uint32_t now = 6900; now <= 7500; now += 300) sensors.update(now);
+  for (uint32_t now = 7500; now <= 8400; now += 300) sensors.update(now);
   assert(sensors.snapshot().gesture == peripherals::Gesture::Upright);
 }
 }  // namespace
@@ -320,6 +408,9 @@ int main() {
   testShortRtcControlWriteIsReportedAsFailure();
   testImuSamplingRestoresReadyAfterTransientReadError();
   testLearnedOrientationGesturesAndShake();
+  testShortKnockPulsesBetweenLegacyPollsAndNoReturnEdgeDoubleCount();
+  testQualificationDurationsAndMillisWrap();
+  testBaseQualificationRestartsAfterDisturbance();
   testImuOutageCancelsTapAndReanchorsMotion();
   testPickupCanFollowTwoMinutesOfStillnessFromBoot();
   testImuOutagePreservesLearnedOrientationAndQuietRecovery();

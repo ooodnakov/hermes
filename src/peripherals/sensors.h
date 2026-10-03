@@ -68,8 +68,10 @@ class Sensors {
   float lastAccelerationMagnitude_ = 1.0f;
   float baseX_ = 0.0f, baseY_ = 0.0f, baseZ_ = 0.0f;
   bool baseSet_ = false;
+  bool baseStableTiming_ = false;
+  bool faceDownTiming_ = false, uprightTiming_ = false;
   bool quietMode_ = false;
-  uint8_t basePolls_ = 0, faceDownPolls_ = 0, uprightPolls_ = 0;
+  uint32_t baseStableSinceMs_ = 0, faceDownSinceMs_ = 0, uprightSinceMs_ = 0;
   uint32_t lastShakeMs_ = 0, previousTapPulseMs_ = 0, lastMotionMs_ = 0;
   uint32_t imuStartedMs_ = 0;
   bool tapArmed_ = true;
