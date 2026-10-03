@@ -10,5 +10,8 @@ trap 'rm -f "$binary"' EXIT
   -I"$root/tests/native_ui/stubs" -I"$root/src" \
   "$root/tests/native_ui/test_familiar_ui.cpp" \
   "$root/src/ui/familiar_ui.cpp" \
+  "$root/src/ui/emoji_text.cpp" \
+  "$root/src/ui/emoji_assets.cpp" \
+  "$root/src/ui/nerd_icons.cpp" \
   -o "$binary"
 "$binary"

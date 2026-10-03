@@ -35,6 +35,9 @@ def test_familiar_ui_native_harness(tmp_path: Path) -> None:
         f"-I{ROOT / 'src'}",
         str(ROOT / "tests/native_ui/test_familiar_ui.cpp"),
         str(ROOT / "src/ui/familiar_ui.cpp"),
+        str(ROOT / "src/ui/emoji_text.cpp"),
+        str(ROOT / "src/ui/emoji_assets.cpp"),
+        str(ROOT / "src/ui/nerd_icons.cpp"),
         "-o",
         str(binary),
     ]

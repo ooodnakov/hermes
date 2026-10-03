@@ -115,6 +115,11 @@ What the device shows/does in plugin mode:
   Page 0 or the newest entry on Page 1 to open its Markdown-formatted text;
   swipe vertically to read longer responses and tap to return. Long responses
   may be shortened to fit the device protocol limit.
+- **Inline emoji and icons (3.49 V1 firmware)** — messages, notifications,
+  labels, and Markdown display colour emoji, including flags, skin tones, and
+  joined sequences, plus Meslo Nerd Font icons. Twemoji artwork by Twitter, Inc.
+  and other contributors is CC BY 4.0; font attribution and license texts ship
+  in the release `notices/`.
 - **`familiar_notify` agent tool** — Hermes itself can ping the desk: banner
   + chirp. "Ping my desk when the build finishes" now works, and cron jobs
   can reach the device the same way.

@@ -1,0 +1,35 @@
+{
+  "bitmap": {
+    "advance": 13,
+    "alpha4_bytes": 288648,
+    "asset_count": 4009,
+    "height": 12,
+    "rgb565_alpha4_sha256": "30bd2df736ebeeccaabac5e2392c3ec794a31582a26a646861e576f854bbfc14",
+    "rgb565_bytes": 1154592,
+    "width": 12
+  },
+  "generated_cpp_sha256": "f155fba2295ff0a91da3bc909cb3f66855f5112f83b4900d38b5e081cf589708",
+  "generator": {
+    "pillow": "12.3.0",
+    "resample": "LANCZOS",
+    "script": "scripts/generate_emoji_assets.py"
+  },
+  "lookup": {
+    "key_bytes": 41630,
+    "key_encoding": "UTF-8, filename codepoints with U+FE0F removed",
+    "key_sha256": "25bfbc332ee5632f3ede80d61419c64d9e0ec0068f8b6c5056a5824b02d9b8ea",
+    "max_codepoints": 9,
+    "max_key_bytes": 32,
+    "record_count": 4009
+  },
+  "schema": 1,
+  "source": {
+    "archive_sha256": "705d79de1460e5e775f362f0d0f01fbe3ef8d65bf4648c490e4649704584f747",
+    "archive_url": "https://github.com/jdecked/twemoji/archive/b6b55fef1e8636b540a6d016a4729ca8cdf2e60b.tar.gz",
+    "commit": "b6b55fef1e8636b540a6d016a4729ca8cdf2e60b",
+    "graphics_license": "CC-BY-4.0",
+    "graphics_license_file": "LICENSE-GRAPHICS.txt",
+    "repository": "https://github.com/jdecked/twemoji",
+    "tag": "v17.0.3"
+  }
+}

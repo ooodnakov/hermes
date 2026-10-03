@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <stdlib.h>
 #include <array>
+#include <string_view>
+
+#include "emoji_text.h"
 
 namespace ui {
 namespace {
@@ -16,6 +19,10 @@ constexpr int16_t kContentX = 8, kContentRight = 632;
 constexpr int16_t kApprovalTop = 130, kApprovalHeight = 36;
 
 uint16_t pageIndex(protocol::Page page) { return static_cast<uint16_t>(page); }
+
+std::string_view textView(const String& text) {
+  return std::string_view(text.c_str(), text.length());
+}
 
 uint8_t utf8SequenceLength(uint8_t lead) {
   if ((lead & 0xe0) == 0xc0) return 2;
@@ -75,17 +82,21 @@ uint16_t countWrappedLines(lgfx::LGFX_Sprite& sprite, const String& source,
     uint16_t lastSpace = UINT16_MAX;
     uint16_t scan = start;
     while (scan < text.length() && text[scan] != '\n') {
-      uint16_t next = scan;
-      const String glyph = utf8Glyph(text, scan, next);
-      if (sprite.textWidth(text.substring(start, next)) > width) break;
+      emoji_text::Token token;
+      size_t tokenOffset = scan;
+      if (!emoji_text::nextToken(textView(text), tokenOffset, token)) break;
+      const uint16_t next = static_cast<uint16_t>(token.end);
+      const String glyph = text.substring(scan, next);
+      if (emoji_text::measure(sprite, textView(text).substr(start, next - start), size) > width) break;
       if (glyph == " ") lastSpace = scan;
       fitEnd = next;
       scan = next;
     }
     if (fitEnd == start) {
-      uint16_t next = start;
-      (void)utf8Glyph(text, start, next);
-      fitEnd = next;
+      size_t tokenOffset = start;
+      emoji_text::Token token;
+      if (emoji_text::nextToken(textView(text), tokenOffset, token))
+        fitEnd = static_cast<uint16_t>(token.end);
     }
     offset = fitEnd;
     if (scan < text.length() && text[scan] != '\n' && lastSpace != UINT16_MAX && lastSpace > start)
@@ -455,9 +466,8 @@ void FamiliarUi::drawMarkdownResponse() {
       sprite_.setFont(fontFor(runStyle | (currentHeadingLevel ? markdown::Bold : markdown::Plain)));
       sprite_.setTextWrap(false);
       sprite_.setTextSize(1.0f);
-      sprite_.setTextColor(foreground, inlineCode || currentCodeBlock ? kPanel : kBg);
-      sprite_.setCursor(runX, y);
-      sprite_.print(run);
+      const uint16_t background = inlineCode || currentCodeBlock ? kPanel : kBg;
+      emoji_text::draw(sprite_, textView(run), runX, y, foreground, background);
       if (link) sprite_.drawFastHLine(runX, y + lineHeight - 2, runWidth, kCyan);
       run = ""; runActive = false; runWidth = 0;
     };
@@ -507,14 +517,14 @@ void FamiliarUi::drawMarkdownResponse() {
       for (uint16_t spanIndex = block.firstSpan;
            spanIndex < block.firstSpan + block.spanCount; ++spanIndex) {
         const markdown::Span& span = responseDocument_.spans[spanIndex];
-        const std::size_t end = static_cast<std::size_t>(span.textBegin) + span.textLength;
-        for (std::size_t offset = span.textBegin; offset < end;) {
-          const uint8_t lead = static_cast<uint8_t>(responseDocument_.text[offset]);
-          const uint8_t nbytes = utf8SequenceLength(lead);
-          std::size_t next = offset + 1;
-          while (next < end && next < offset + nbytes &&
-                 (static_cast<uint8_t>(responseDocument_.text[next]) & 0xc0) == 0x80) ++next;
-          const std::string glyphBytes = responseDocument_.text.substr(offset, next - offset);
+        const std::string_view spanText(responseDocument_.text.data() + span.textBegin,
+                                        span.textLength);
+        for (size_t offset = 0; offset < spanText.size();) {
+          size_t tokenOffset = offset;
+          emoji_text::Token token;
+          if (!emoji_text::nextToken(spanText, tokenOffset, token)) break;
+          const size_t next = token.end;
+          const std::string glyphBytes(spanText.substr(offset, next - offset));
           const String glyph(glyphBytes.c_str());
           offset = next;
           if (glyph == "\n") { nextLine(); continue; }
@@ -523,7 +533,7 @@ void FamiliarUi::drawMarkdownResponse() {
               (currentHeadingLevel ? markdown::Bold : markdown::Plain));
           sprite_.setFont(fontFor(style));
           sprite_.setTextSize(1.0f);
-          const int16_t glyphWidth = static_cast<int16_t>(sprite_.textWidth(glyph));
+          const int16_t glyphWidth = emoji_text::tokenWidth(sprite_, spanText, token);
           if (cursorX + glyphWidth > kX + kWidth && cursorX > indentX) nextLine();
           if (atLineStart && glyph == " " && !currentCodeBlock) continue;
           if (!runActive || runStyle != span.style || runLine != lineNumber ||
@@ -565,24 +575,26 @@ void FamiliarUi::drawText(const String& source, int16_t x, int16_t y, int16_t wi
   while (firstLineEnd < text.length() && text[firstLineEnd] != '\n') ++firstLineEnd;
   const String firstLine = text.substring(0, firstLineEnd);
   const bool hasRemainder = firstLineEnd < text.length();
-  if (!hasRemainder && sprite_.textWidth(firstLine) <= width) {
+  if (!hasRemainder && emoji_text::measure(sprite_, textView(firstLine), size) <= width) {
     fitted = firstLine;
   } else {
-    const bool useSuffix = ellipsis && sprite_.textWidth(suffix) <= width;
+    const bool useSuffix = ellipsis && emoji_text::measure(sprite_, textView(suffix), size) <= width;
     uint16_t offset = 0;
     while (offset < firstLine.length()) {
-      uint16_t next = offset;
-      const String glyph = utf8Glyph(firstLine, offset, next);
+      size_t tokenOffset = offset;
+      emoji_text::Token token;
+      if (!emoji_text::nextToken(textView(firstLine), tokenOffset, token)) break;
+      const uint16_t next = static_cast<uint16_t>(token.end);
+      const String glyph = firstLine.substring(offset, next);
       const String candidate = fitted + glyph;
-      if (sprite_.textWidth(useSuffix ? candidate + suffix : candidate) > width) break;
+      const String visible = useSuffix ? candidate + suffix : candidate;
+      if (emoji_text::measure(sprite_, textView(visible), size) > width) break;
       fitted = candidate;
       offset = next;
     }
     if (useSuffix) fitted += suffix;
   }
-  sprite_.setTextColor(color, background);
-  sprite_.setCursor(x, y);
-  sprite_.print(fitted);
+  emoji_text::draw(sprite_, textView(fitted), x, y, color, background, size);
 }
 
 void FamiliarUi::drawCenteredText(const String& source, const Rect& rect,
@@ -591,7 +603,7 @@ void FamiliarUi::drawCenteredText(const String& source, const Rect& rect,
   sprite_.setFont(&fonts::efontJA_12);
   sprite_.setTextWrap(false);
   sprite_.setTextSize(size);
-  const int16_t textWidth = static_cast<int16_t>(sprite_.textWidth(text));
+  const int16_t textWidth = emoji_text::measure(sprite_, textView(text), size);
   const int16_t textHeight = static_cast<int16_t>(sprite_.fontHeight());
   const int16_t x = static_cast<int16_t>(rect.x + (rect.w - min<int16_t>(rect.w, textWidth)) / 2);
   const int16_t y = static_cast<int16_t>(rect.y + (rect.h - textHeight) / 2);
@@ -629,17 +641,21 @@ void FamiliarUi::drawWrapped(const String& source, int16_t x, int16_t y, int16_t
     uint16_t lastSpace = UINT16_MAX;
     uint16_t scan = start;
     while (scan < text.length() && text[scan] != '\n') {
-      uint16_t next = scan;
-      const String glyph = utf8Glyph(text, scan, next);
-      if (sprite_.textWidth(text.substring(start, next)) > width) break;
+      size_t tokenOffset = scan;
+      emoji_text::Token token;
+      if (!emoji_text::nextToken(textView(text), tokenOffset, token)) break;
+      const uint16_t next = static_cast<uint16_t>(token.end);
+      const String glyph = text.substring(scan, next);
+      if (emoji_text::measure(sprite_, textView(text).substr(start, next - start), scale) > width) break;
       if (glyph == " ") lastSpace = scan;
       fitEnd = next;
       scan = next;
     }
     if (fitEnd == start) {
-      uint16_t next = start;
-      (void)utf8Glyph(text, start, next);
-      fitEnd = next;
+      size_t tokenOffset = start;
+      emoji_text::Token token;
+      if (emoji_text::nextToken(textView(text), tokenOffset, token))
+        fitEnd = static_cast<uint16_t>(token.end);
     }
     uint16_t lineEnd = fitEnd;
     uint16_t nextOffset = fitEnd;

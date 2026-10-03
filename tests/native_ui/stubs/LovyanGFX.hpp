@@ -26,15 +26,25 @@ struct TextCall {
   uint16_t foreground = 0, background = 0;
 };
 
+struct ImageCall {
+  int x = 0, y = 0, width = 0, height = 0;
+  std::vector<uint16_t> pixels;
+};
+
 class LGFX_Sprite {
  public:
-  void fillScreen(uint16_t) { calls.clear(); }
+  void fillScreen(uint16_t) { calls.clear(); imageCalls.clear(); }
   void fillRect(int, int, int, int, uint16_t) {}
   void drawFastHLine(int, int, int, uint16_t) {}
   void drawFastVLine(int, int, int, uint16_t) {}
   void drawRoundRect(int, int, int, int, int, uint16_t) {}
   void fillRoundRect(int, int, int, int, int, uint16_t) {}
   void drawCircle(int, int, int, uint16_t) {}
+  void pushImage(int x, int y, int width, int height, const uint16_t* pixels) {
+    ImageCall call{x, y, width, height, {}};
+    call.pixels.assign(pixels, pixels + static_cast<size_t>(width) * height);
+    imageCalls.push_back(call);
+  }
   void setFont(const IFont* font) { selectedFont = font; }
   void setTextWrap(bool x, bool y = false) { wrapX = x; wrapY = y; }
   void setTextSize(float size) { textSize = size; }
@@ -67,6 +77,7 @@ class LGFX_Sprite {
   bool wrapX = true, wrapY = false;
   float textSize = 1.0f;
   std::vector<TextCall> calls;
+  std::vector<ImageCall> imageCalls;
 
  private:
   int cursorX = 0, cursorY = 0;

@@ -75,6 +75,48 @@ def validate_asset_config(config: dict) -> None:
         raise ValueError("generated SD config is not the 640x172 349-v1 profile")
 
 
+def copy_release_notices(destination: Path) -> dict[str, list[str]]:
+    """Copy only required third-party notices, never source fonts or artwork."""
+    groups = {
+        "twemoji": [
+            ("assets/emoji/README.md", "twemoji/README.md"),
+            ("assets/emoji/LICENSE-GRAPHICS.txt", "twemoji/LICENSE-GRAPHICS.txt"),
+            ("assets/emoji/manifest.json", "twemoji/manifest.json"),
+        ],
+        "nerd_font": [
+            ("assets/nerd_icons/licenses/NOTICE.md", "nerd_font/NOTICE.md"),
+            ("assets/nerd_icons/licenses/Apache-2.0.txt", "nerd_font/Apache-2.0.txt"),
+            ("assets/nerd_icons/licenses/OFL-1.1.txt", "nerd_font/OFL-1.1.txt"),
+        ],
+    }
+    copied: dict[str, list[str]] = {}
+    for group, files in groups.items():
+        paths = []
+        for source_relative, bundle_relative in files:
+            source = ROOT / source_relative
+            if not source.is_file():
+                raise FileNotFoundError(f"missing release attribution file: {source_relative}")
+            target = destination / "notices" / bundle_relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            paths.append(target.relative_to(destination).as_posix())
+        copied[group] = paths
+    return copied
+
+
+def release_file_records(root: Path) -> list[dict[str, object]]:
+    records = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if path == root / "manifest.json":
+            continue
+        records.append({
+            "path": path.relative_to(root).as_posix(),
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256(path),
+        })
+    return records
+
+
 def git_state() -> dict:
     head = run(["git", "rev-parse", "HEAD"])
     branch = run(["git", "branch", "--show-current"])
@@ -208,6 +250,7 @@ def main() -> int:
         shutil.copy2(partitions, firmware_out / "partitions.bin")
         shutil.copy2(boot_app0, firmware_out / "boot_app0.bin")
         asset_info = validate_and_copy_assets(generated_assets, out / "sdcard" / ASSET_DIR)
+        notices = copy_release_notices(out)
 
     versions = pio_versions(args.pio)
     source = git_state()
@@ -244,12 +287,7 @@ Build source commit and dirty-state counts, toolchain versions, asset metadata,
 and per-file checksums are in manifest.json.
 """
     (out / "README.txt").write_text(readme, encoding="utf-8")
-    files = []
-    for path in sorted(p for p in out.rglob("*") if p.is_file()):
-        if path.name == "manifest.json":
-            continue
-        files.append({"path": path.relative_to(out).as_posix(),
-                      "size_bytes": path.stat().st_size, "sha256": sha256(path)})
+    files = release_file_records(out)
     manifest = {
         "format_version": 1,
         "profile": "waveshare-esp32-s3-touch-lcd-349-v1",
@@ -271,6 +309,7 @@ and per-file checksums are in manifest.json.
         "firmware_origin": "existing .pio build artifact; packaging does not rebuild",
         "flash_layout": FLASH_LAYOUT,
         "sd_assets": asset_info,
+        "notices": notices,
         "files": files,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "ui/familiar_ui.h"
+#include "ui/emoji_text.h"
 
 namespace {
 struct Capture {
@@ -313,6 +314,135 @@ void testUtf8TypographyMeasuredWrappingAcrossPages() {
   assertTextCallsFit(sprite);
 }
 
+void testEmojiClustersAndCodepointSafeRendering() {
+  const std::string sample = "x👨‍👩‍👧‍👦👍🏽🇷🇺1️⃣";
+  size_t offset = 0;
+  ui::emoji_text::Token token;
+  assert(ui::emoji_text::nextToken(sample, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Text);
+  assert(sample.substr(token.begin, token.end - token.begin) == "x");
+  assert(ui::emoji_text::nextToken(sample, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Emoji);
+  assert(sample.substr(token.begin, token.end - token.begin) == "👨‍👩‍👧‍👦");
+  assert(ui::emoji_text::nextToken(sample, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Emoji);
+  assert(sample.substr(token.begin, token.end - token.begin) == "👍🏽");
+  assert(ui::emoji_text::nextToken(sample, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Emoji);
+  assert(sample.substr(token.begin, token.end - token.begin) == "🇷🇺");
+  assert(ui::emoji_text::nextToken(sample, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Emoji);
+  assert(sample.substr(token.begin, token.end - token.begin) == "1️⃣");
+  assert(!ui::emoji_text::nextToken(sample, offset, token));
+
+  lgfx::LGFX_Sprite metricsSprite;
+  metricsSprite.setFont(&fonts::efontJA_12);
+  assert(ui::emoji_text::measure(metricsSprite, "👨‍👩‍👧‍👦") == 13);
+
+  const auto assertTokens = [](const std::string& value,
+                               const std::vector<std::string>& expected) {
+    size_t at = 0;
+    size_t index = 0;
+    ui::emoji_text::Token part;
+    while (ui::emoji_text::nextToken(value, at, part)) {
+      assert(index < expected.size());
+      assert(value.substr(part.begin, part.end - part.begin) == expected[index++]);
+    }
+    assert(index == expected.size());
+  };
+  assertTokens("1😀", {"1", "😀"});
+  assertTokens("123 ABC", {"1", "2", "3", " ", "A", "B", "C"});
+  assertTokens("#heading", {"#", "h", "e", "a", "d", "i", "n", "g"});
+  assertTokens("* x", {"*", " ", "x"});
+  assertTokens("1️😄", {"1️", "😄"});
+  assertTokens("⭐", {"⭐"});
+  assertTokens("↔️", {"↔️"});
+  assertTokens("↩️", {"↩️"});
+  assertTokens("▶️", {"▶️"});
+  assertTokens("🔲", {"🔲"});
+  assertTokens("◻️", {"◻️"});
+  assertTokens("🙂‍↔️", {"🙂‍↔️"});
+  assertTokens("⭐︎", {"⭐︎"});
+  assertTokens("🙂‍A", {"🙂‍", "A"});
+  const std::string incompleteTagFlag = "🏴\U000E0067";
+  assertTokens(incompleteTagFlag, {incompleteTagFlag});
+  offset = 0;
+  assert(ui::emoji_text::nextToken(incompleteTagFlag, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Text);
+  assertTokens("\xF0\x80\x80\x80😀", {"\xF0", "\x80", "\x80", "\x80", "😀"});
+  assertTokens("\xED\xA0\x80😀", {"\xED", "\xA0", "\x80", "😀"});
+  assertTokens("\xF4\x90\x80\x80😀", {"\xF4", "\x90", "\x80", "\x80", "😀"});
+
+  const std::string nerd = "x\U000F0001у";
+  offset = 0;
+  assert(ui::emoji_text::nextToken(nerd, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Text);
+  assert(ui::emoji_text::nextToken(nerd, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::NerdIcon);
+  assert(token.codepoint == 0xf0001);
+  assert(ui::emoji_text::nextToken(nerd, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Text);
+  assert(!ui::emoji_text::nextToken(nerd, offset, token));
+
+  offset = 0;
+  const std::string textPresentation = "⭐︎";
+  assert(ui::emoji_text::nextToken(textPresentation, offset, token));
+  assert(token.kind == ui::emoji_text::TokenKind::Text);
+
+  lgfx::LGFX_Sprite sprite;
+  sprite.setFont(&fonts::efontJA_12);
+  ui::emoji_text::draw(sprite, sample, 10, 20, 0xffff, 0x0000);
+  assert(!sprite.imageCalls.empty());
+  assert(textHas(sprite, "x"));
+  assert(!textHas(sprite, "👨"));  // bitmap clusters never reach the font printer
+  for (const auto& call : sprite.imageCalls) {
+    assert(call.width > 0 && call.height == 1);
+    assert(call.x >= 0 && call.x + call.width <= ui::FamiliarUi::kWidth);
+    assert(call.y >= 0 && call.y + call.height <= ui::FamiliarUi::kHeight);
+  }
+
+  sprite.fillScreen(0);
+  ui::emoji_text::draw(sprite, nerd, 10, 40, 0x07e0, 0x0000);
+  assert(!sprite.imageCalls.empty());
+  assert(textHas(sprite, "x") && textHas(sprite, "у"));
+
+  sprite.fillScreen(0);
+  ui::emoji_text::draw(sprite, "😄", 10, 10, 0xffff, 0x0000, 3.0f);
+  assert(!sprite.imageCalls.empty());
+  for (const auto& call : sprite.imageCalls) assert(call.width <= 255);
+  sprite.fillScreen(0);
+  ui::emoji_text::draw(sprite, "😄", 10, 10, 0xffff, 0x0000, 30.0f);
+  assert(!sprite.imageCalls.empty());
+  for (const auto& call : sprite.imageCalls) assert(call.width <= 255);
+}
+
+void testEmojiRenderingInPlainAndStyledMarkdownText() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Fleet;
+  state.hostPages[2].set = true;
+  state.hostPages[2].title = "FLEET";
+  state.hostPages[2].lines[0] = "Привет 👩🏽‍🚀 🇷🇺 1️⃣";
+  view.render(200);
+  assert(!sprite.imageCalls.empty());
+  assert(textHas(sprite, "Привет"));
+  assertTextCallsFit(sprite);
+
+  state.page = protocol::Page::Face;
+  state.agentResponseMarkdown = "**bold 😄**\n\n`code 👩‍💻` 🇷🇺";
+  const std::string sourceBefore = state.agentResponseMarkdown.str();
+  view.render(201);
+  tap(view, 200, 120, 202);
+  view.render(203);
+  assert(!sprite.imageCalls.empty());
+  assert(textHas(sprite, "bold"));
+  assert(textHas(sprite, "code"));
+  assert(state.agentResponseMarkdown.str() == sourceBefore);
+  assertTextCallsFit(sprite);
+}
+
 void testFaceLivenessAtExpiryAndMillisWrap() {
   lgfx::LGFX_Sprite sprite;
   protocol::UiState state;
@@ -467,6 +597,8 @@ int main() {
   testSwipeCannotResolveApprovalAndModalReturnsToOrigin();
   testMessageHistoryRequests();
   testUtf8TypographyMeasuredWrappingAcrossPages();
+  testEmojiClustersAndCodepointSafeRendering();
+  testEmojiRenderingInPlainAndStyledMarkdownText();
   testFaceLivenessAtExpiryAndMillisWrap();
   testTextKeepsFilledTabAndRunningCardBackgrounds();
   testHostRowsCompactBlankParagraphsAndTapRenderedRow();
