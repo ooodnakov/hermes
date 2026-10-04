@@ -42,6 +42,28 @@ _RESCAN_SECS = 3.0
 _UNWEDGE_AFTER_FAILS = 8
 _UNWEDGE_COOLDOWN = 300.0
 _NET_SEND_QUEUE_SIZE = 64
+_MAX_PAYLOAD_BYTES = 4095
+_MAX_WIRE_LINE_BYTES = _MAX_PAYLOAD_BYTES + 1
+_AUTH_TIMEOUT_SECS = 10.0
+
+
+def _bounded_lines(stream):
+    """Yield newline-delimited payloads without ever accumulating a long line.
+
+    Oversized lines are discarded through their newline so the following frame
+    remains usable.  The newline is retained because JSON accepts trailing
+    whitespace and this keeps the exact 4095-byte payload boundary simple.
+    """
+    while True:
+        raw = stream.readline(_MAX_WIRE_LINE_BYTES + 1)
+        if not raw:
+            return
+        if len(raw) <= _MAX_WIRE_LINE_BYTES and raw.endswith(b"\n"):
+            yield raw
+            continue
+        while raw and not raw.endswith(b"\n"):
+            raw = stream.readline(_MAX_WIRE_LINE_BYTES + 1)
+        yield None
 
 
 def _queued_sender(write, disconnect, on_close=None):
@@ -98,6 +120,7 @@ def _queued_sender(write, disconnect, on_close=None):
             raise ConnectionError("network client send queue is full")
 
     sender.close = closed.set
+    sender.disconnect = fail_peer
     threading.Thread(target=pump, name="familiar-net-send", daemon=True).start()
     return sender
 
@@ -131,6 +154,8 @@ class SerialLink:
         self._net_clients: list = []
         self._net_lock = threading.Lock()
         self._last_net_beat = 0.0
+        self._servers: list = []
+        self._servers_lock = threading.Lock()
         # optional () -> list[dict]: snapshot frames pushed to each client on
         # connect (deck layout, pending approvals, …) — broadcast only carries
         # what happens AFTER a client joins
@@ -226,9 +251,16 @@ class SerialLink:
         class _Handler(socketserver.StreamRequestHandler):
             def handle(self):
                 peer = f"{self.client_address[0]}:{self.client_address[1]}"
-                if token and not link._auth_ok(self.rfile.readline(), token):
-                    logger.warning("familiar tcp auth failed from %s", peer)
-                    return
+                if token:
+                    self.connection.settimeout(_AUTH_TIMEOUT_SECS)
+                    try:
+                        first = next(_bounded_lines(self.rfile), None)
+                    except (OSError, socket.timeout):
+                        first = None
+                    if first is None or not link._auth_ok(first, token):
+                        logger.warning("familiar tcp auth failed from %s", peer)
+                        return
+                    self.connection.settimeout(None)
                 w = self.wfile
 
                 def write(data: bytes) -> None:
@@ -249,7 +281,9 @@ class SerialLink:
                 link._send_welcome(sender)
                 logger.info("familiar connected via tcp %s", peer)
                 try:
-                    for raw in self.rfile:
+                    for raw in _bounded_lines(self.rfile):
+                        if raw is None:
+                            continue
                         try:
                             evt = json.loads(raw.decode("utf-8", "replace"))
                         except Exception:
@@ -272,6 +306,11 @@ class SerialLink:
         except OSError as e:
             logger.warning("familiar tcp port %s unavailable: %s", port, e)
             return None
+        with self._servers_lock:
+            if self._stop.is_set():
+                srv.server_close()
+                return None
+            self._servers.append(srv)
         threading.Thread(target=srv.serve_forever, name="familiar-tcp", daemon=True).start()
         bound = srv.server_address[1]
         logger.info("familiar tcp transport listening on :%s%s", bound,
@@ -295,7 +334,7 @@ class SerialLink:
                 peer = "?"
             if token:
                 try:
-                    first = conn.recv(timeout=10)
+                    first = conn.recv(timeout=_AUTH_TIMEOUT_SECS)
                 except Exception:
                     return
                 if not link._auth_ok(first, token):
@@ -319,6 +358,10 @@ class SerialLink:
             logger.info("familiar connected via ws %s", peer)
             try:
                 for msg in conn:
+                    if (not isinstance(msg, (str, bytes))
+                            or len(msg.encode("utf-8") if isinstance(msg, str) else msg)
+                            > _MAX_PAYLOAD_BYTES):
+                        continue
                     try:
                         evt = json.loads(msg)
                     except Exception:
@@ -335,10 +378,15 @@ class SerialLink:
                 logger.info("familiar ws %s disconnected", peer)
 
         try:
-            srv = serve(handler, "0.0.0.0", int(port))
+            srv = serve(handler, "0.0.0.0", int(port), max_size=_MAX_PAYLOAD_BYTES)
         except OSError as e:
             logger.warning("familiar ws port %s unavailable: %s", port, e)
             return None
+        with self._servers_lock:
+            if self._stop.is_set():
+                srv.shutdown()
+                return None
+            self._servers.append(srv)
         threading.Thread(target=srv.serve_forever, name="familiar-ws", daemon=True).start()
         bound = srv.socket.getsockname()[1]
         logger.info("familiar ws transport listening on :%s%s", bound,
@@ -382,6 +430,25 @@ class SerialLink:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._servers_lock:
+            servers, self._servers = self._servers, []
+        for srv in servers:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            try:
+                srv.server_close()
+            except (AttributeError, OSError):
+                pass
+        with self._net_lock:
+            clients = [sender for _kind, sender, _peer in self._net_clients]
+        for sender in clients:
+            disconnect = getattr(sender, "disconnect", None)
+            if disconnect:
+                disconnect()
+            self._net_del(sender)
+        self._drop()
 
     # -- link thread -------------------------------------------------------
 

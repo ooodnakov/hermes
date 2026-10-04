@@ -119,6 +119,62 @@ def test_tcp_malformed_frame_recovers_and_client_can_reconnect():
     assert wait_for(lambda: not link._net_clients)
 
 
+def test_tcp_discards_oversized_line_and_recovers_at_payload_boundary():
+    link, seen = make_link()
+    port = link.start_tcp(0)
+    s = tcp_connect(port)
+
+    # 4095 payload bytes is accepted by the framer (though not valid JSON).
+    s.sendall(b" " * serial_link._MAX_PAYLOAD_BYTES + b"\n")
+    s.sendall(b"x" * (serial_link._MAX_PAYLOAD_BYTES + 1)
+              + b'{"cmd":"hidden"}\n')
+    s.sendall(b'{"cmd":"deck","i":4}\n')
+
+    assert wait_for(lambda: seen == [{"cmd": "deck", "i": 4}])
+    s.close()
+    link.stop()
+
+
+def test_tcp_oversized_auth_is_rejected_without_parsing_suffix():
+    link, seen = make_link()
+    port = link.start_tcp(0, token=TOKEN)
+    s = tcp_connect(port)
+    suffix = json.dumps({"type": "auth", "token": TOKEN}).encode()
+    s.sendall(b"x" * (serial_link._MAX_PAYLOAD_BYTES + 1) + suffix + b"\n")
+    assert readline(s) == b""
+    assert seen == []
+    assert link._net_clients == []
+    s.close()
+    link.stop()
+
+
+def test_tcp_idle_unauthenticated_connection_times_out(monkeypatch):
+    monkeypatch.setattr(serial_link, "_AUTH_TIMEOUT_SECS", 0.1)
+    link, _seen = make_link()
+    port = link.start_tcp(0, token=TOKEN)
+    s = tcp_connect(port)
+
+    assert wait_for(lambda: readline(s) == b"", timeout=1)
+    assert link._net_clients == []
+    s.close()
+    link.stop()
+
+
+def test_stop_closes_listener_and_connected_clients():
+    link, _seen = make_link()
+    port = link.start_tcp(0)
+    s = tcp_connect(port)
+    s.sendall(b'{"hello":"hermes-buddy"}\n')
+    assert wait_for(lambda: link._net_clients)
+
+    link.stop()
+
+    assert wait_for(lambda: not link._net_clients)
+    assert readline(s) == b""
+    with pytest.raises(OSError):
+        tcp_connect(port)
+    s.close()
+
 def test_slow_network_sender_is_isolated_from_other_clients(monkeypatch):
     monkeypatch.setattr(serial_link, "_NET_SEND_QUEUE_SIZE", 1)
     link, _seen = make_link()
@@ -297,6 +353,17 @@ def test_ws_auth_roundtrip():
         assert wait_for(lambda: seen)
         assert seen[0] == {"cmd": "deck", "i": 0}
     assert wait_for(lambda: not link._net_clients)
+
+
+def test_ws_malformed_frame_recovers():
+    ws_client = _ws_client()
+    link, seen = make_link()
+    port = link.start_ws(0)
+    with ws_client.connect(f"ws://127.0.0.1:{port}") as conn:
+        conn.send('{"cmd":')
+        conn.send('{"cmd":"deck","i":5}')
+        assert wait_for(lambda: seen == [{"cmd": "deck", "i": 5}])
+    link.stop()
 
 
 def test_ws_and_tcp_share_broadcast():
