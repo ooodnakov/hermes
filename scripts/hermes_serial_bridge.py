@@ -33,6 +33,8 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
 
+_MESSAGE_PREVIEW_CHARS = 200
+
 
 ATTENTION_WORDS = ("?", "approve", "confirm", "permission", "choose", "which", "should i", "do you want")
 DEFAULT_ACTIONS = {
@@ -509,7 +511,7 @@ def read_snapshot(db_path: Path, jobs: JobManager | None = None) -> Snapshot:
             latest_user_ts = tsf
         if role == "assistant" and not latest_assistant_ts:
             latest_assistant_ts = tsf
-        entries.append(f"{ts} {role[0]}: {compact(body, 70)}")
+        entries.append(f"{ts} {role[0]}: {compact(body, _MESSAGE_PREVIEW_CHARS)}")
         if r is latest:
             latest_content = compact(body, 140)
 

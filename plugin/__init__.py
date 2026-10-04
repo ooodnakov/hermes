@@ -35,6 +35,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
@@ -100,10 +101,23 @@ _TOOL_STATUS = {
 _STATS_REFRESH_SECS = 60.0
 
 _lock = threading.Lock()
+_MAX_AGENT_MARKDOWN_BYTES = 3072
+_MAX_DEVICE_JSON_BYTES = 4095
+_MAX_DETAIL_BODY_BYTES = 3200
+_MAX_RETAINED_DETAIL_BYTES = 16 * 1024
+_MESSAGE_PREVIEW_CHARS = 200
+_MARKDOWN_CLIPPED_MARKER = "\n\n[Response clipped]"
 _turns: set[str] = set()                  # session_ids with an LLM call in flight
 _pending: OrderedDict[str, str] = OrderedDict()   # approval session_key -> text
 _entries: deque[str] = deque(maxlen=40)   # newest-first ticker; device shows 5, scrollback pages the rest
+_entry_ids: deque[str] = deque(maxlen=40)
+_entry_previews: deque[str] = deque(maxlen=40)
+_entry_details: OrderedDict[str, dict] = OrderedDict()
+_entry_id_prefix = uuid.uuid4().hex  # IDs from a previous process can never resolve here.
+_entry_id_counter = 0
 _msg = "Familiar linked to Hermes"
+_agent_response_markdown = ""
+_agent_response_markdown_truncated = False
 _stats = {"total": 0, "tokens_today": 0, "tools_today": 0, "at": 0.0}
 
 _link: SerialLink | None = None
@@ -112,7 +126,7 @@ _jobs: _actions.JobManager | None = None
 # Presence: last real interaction per surface, so sound/voice land where
 # Jason actually is. usb/tcp origins = desk, ws = phone.
 _PRESENCE_WINDOW = 300.0                  # seconds; older than this = unknown
-_INTERACTION_CMDS = {"touch", "swipe", "deck", "permission", "action", "gesture", "msgs"}
+_INTERACTION_CMDS = {"touch", "swipe", "deck", "permission", "action", "gesture", "msgs", "msg"}
 _presence = {"desk": 0.0, "phone": 0.0}
 _desk_quiet = False                       # device reported face-down
 _telemetry: dict = {}                     # last device telemetry frame
@@ -137,6 +151,206 @@ def _active_surface() -> str | None:
 
 def _desk_should_be_quiet() -> bool:
     return _desk_quiet or _active_surface() == "phone"
+
+
+def _new_entry_id() -> str:
+    global _entry_id_counter
+    _entry_id_counter += 1
+    return f"{_entry_id_prefix}-{_entry_id_counter:x}"
+
+
+def _sync_entry_ids() -> None:
+    """Repair alignment if legacy fixtures/extensions mutate _entries directly."""
+    if list(_entries) == list(_entry_previews) and len(_entry_ids) == len(_entries):
+        return
+    _entry_ids.clear()
+    _entry_previews.clear()
+    _entry_details.clear()
+    for preview in _entries:
+        _entry_previews.append(preview)
+        _entry_ids.append(_new_entry_id())
+
+
+def _append_entry(preview: str, body: str | None = None, role: str | None = None) -> str:
+    """Append a ticker row and its bounded optional full-text record.
+
+    Caller holds _lock, matching the historic _entries append sites.
+    """
+    _sync_entry_ids()
+    if len(_entries) == _entries.maxlen and _entry_ids:
+        evicted = _entry_ids[-1]
+        _entry_details.pop(evicted, None)
+    entry_id = _new_entry_id()
+    _entries.appendleft(str(preview))
+    _entry_previews.appendleft(str(preview))
+    _entry_ids.appendleft(entry_id)
+    if body is not None:
+        stored, clipped = _utf8_prefix(str(body), _MAX_RETAINED_DETAIL_BYTES)
+        _entry_details[entry_id] = {
+            "body": stored,
+            "role": role or "system",
+            "truncated": clipped,
+        }
+    return entry_id
+
+
+def _entry_id_snapshot(offset: int = 0, count: int = 5) -> list[str]:
+    _sync_entry_ids()
+    return list(_entry_ids)[offset:offset + count]
+
+
+def _seed_recent_messages(db_path: Path | None = None) -> int:
+    """Seed the in-memory MSGS history from recent gateway messages, read-only.
+
+    This runs only during gateway startup. Bound both the row count and each
+    selected body before materializing the results, then use the regular entry
+    path so message IDs and retained-body limits stay consistent with live rows.
+    """
+    with _lock:
+        if _entries:
+            return 0
+
+    db_path = db_path or (Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+                          / "state.db")
+    now = time.time()
+    try:
+        con = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.5)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                """
+                SELECT m.timestamp, m.role, substr(m.content, 1, ?) AS content
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE m.timestamp >= ?
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content IS NOT NULL
+                  AND length(trim(m.content)) > 0
+                  AND COALESCE(m.content, '') NOT LIKE '[IMPORTANT: You are running as a scheduled cron job.%'
+                ORDER BY m.timestamp DESC, m.id DESC
+                LIMIT 40
+                """,
+                (_MAX_RETAINED_DETAIL_BYTES + 1, now - 24 * 3600),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("familiar: unable to seed recent messages from state.db", exc_info=True)
+        return 0
+
+    seeded = 0
+    with _lock:
+        # A concurrently delivered live hook wins over the startup snapshot.
+        if _entries:
+            return 0
+        _sync_entry_ids()
+        for row in reversed(rows):
+            role = str(row["role"] or "")
+            if role not in ("user", "assistant"):
+                continue
+            try:
+                stamp = datetime.fromtimestamp(float(row["timestamp"])).strftime("%H:%M")
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+            body = str(row["content"] or "")
+            if not body.strip():
+                continue
+            preview = _actions.compact(body, _MESSAGE_PREVIEW_CHARS)
+            _append_entry(f"{stamp} {role[0]}: {preview}", body, role)
+            seeded += 1
+    return seeded
+
+
+def _fit_detail_response(frame: dict) -> dict:
+    """Fit a detail response into the complete JSON line budget."""
+    body, clipped = _utf8_prefix(str(frame.get("body", "")), _MAX_DETAIL_BODY_BYTES)
+    retained_truncated = bool(frame.get("retained_truncated", frame.get("truncated")))
+    base = dict(frame)
+
+    def candidate(chars: int) -> dict:
+        out = dict(base)
+        out["body"] = body[:chars]
+        chunk_shortened = clipped or chars < len(body)
+        out["has_more"] = bool(base.get("has_more")) or chunk_shortened
+        out["retained_truncated"] = retained_truncated
+        out["truncated"] = retained_truncated or out["has_more"]
+        return out
+
+    full = candidate(len(body))
+    if _wire_json_size(full) <= _MAX_DEVICE_JSON_BYTES:
+        return full
+    low, high, best = 0, len(body), None
+    while low <= high:
+        mid = (low + high) // 2
+        maybe = candidate(mid)
+        if _wire_json_size(maybe) <= _MAX_DEVICE_JSON_BYTES:
+            best = maybe
+            low = mid + 1
+        else:
+            high = mid - 1
+    if best is not None:
+        return best
+    # IDs are internally short; this fallback protects against malformed input.
+    fallback = {"type": "msg", "id": str(frame.get("id", ""))[:64], "body": "",
+                "role": str(frame.get("role", ""))[:32], "body_offset": 0,
+                "body_total": 0, "has_more": False, "retained_truncated": False,
+                "truncated": True,
+                "error": str(frame.get("error", "oversize"))[:32]}
+    return fallback
+
+
+def _send_message_detail(entry_id: str, offset: object = 0) -> None:
+    if _link is None:
+        return
+    entry_id = str(entry_id or "")[:64]
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        offset = None
+    with _lock:
+        _sync_entry_ids()
+        if entry_id not in _entry_ids:
+            frame = {"type": "msg", "id": entry_id, "body": "", "role": "",
+                     "body_offset": 0 if offset is None else offset, "body_total": 0,
+                     "has_more": False, "retained_truncated": False,
+                     "truncated": False, "error": "stale"}
+        else:
+            detail = _entry_details.get(entry_id)
+            if detail is None:
+                frame = {"type": "msg", "id": entry_id, "body": "", "role": "",
+                         "body_offset": 0 if offset is None else offset, "body_total": 0,
+                         "has_more": False, "retained_truncated": False,
+                         "truncated": False, "error": "unavailable"}
+            elif offset is None or offset > len(detail["body"].encode("utf-8")):
+                frame = {"type": "msg", "id": entry_id, "body": "", "role": detail["role"],
+                         "body_offset": 0 if offset is None else offset,
+                         "body_total": len(detail["body"].encode("utf-8")),
+                         "has_more": False, "retained_truncated": detail["truncated"],
+                         "truncated": detail["truncated"],
+                         "error": "offset"}
+            else:
+                retained = detail["body"].encode("utf-8")
+                try:
+                    # The reader advances only by returned UTF-8 byte lengths;
+                    # reject arbitrary offsets that split a code point.
+                    retained[:offset].decode("utf-8")
+                except UnicodeDecodeError:
+                    frame = {"type": "msg", "id": entry_id, "body": "", "role": detail["role"],
+                             "body_offset": offset, "body_total": len(retained),
+                             "has_more": False, "retained_truncated": detail["truncated"],
+                             "truncated": detail["truncated"],
+                             "error": "offset"}
+                else:
+                    remaining = retained[offset:].decode("utf-8")
+                    chunk, _ = _utf8_prefix(remaining, _MAX_DETAIL_BODY_BYTES)
+                    chunk_bytes = chunk.encode("utf-8")
+                    next_offset = offset + len(chunk_bytes)
+                    frame = {
+                        "type": "msg", "id": entry_id, "body": chunk,
+                        "role": detail["role"], "body_offset": offset,
+                        "body_total": len(retained), "has_more": next_offset < len(retained),
+                        "retained_truncated": detail["truncated"],
+                        "truncated": detail["truncated"] or next_offset < len(retained),
+                    }
+    _link.send(_fit_detail_response(frame))
 
 
 def _tool_status(tool_name: str) -> str:
@@ -233,7 +447,8 @@ def _surface_job_result() -> None:
     ok = res.get("rc", 0) == 0
     stamp = datetime.now().strftime("%H:%M")
     with _lock:
-        _entries.appendleft(f"{stamp} >{label}: {_actions.compact(text, 70)}")
+        _append_entry(f"{stamp} >{label}: {_actions.compact(text, _MESSAGE_PREVIEW_CHARS)}",
+                      str(res.get("text") or ""), "job")
     _set_msg(f"[{label}] {text}")
     _link.send({"type": "notify", "msg": f"{label}: {text}",
                 "sound": "ack" if ok else "alert"})
@@ -250,7 +465,8 @@ def _loom_tick() -> None:
     stamp = datetime.now().strftime("%H:%M")
     with _lock:
         for ev in events[:6]:
-            _entries.appendleft(f"{stamp} L: {_actions.compact(ev['text'], 70)}")
+            _append_entry(f"{stamp} L: {_actions.compact(ev['text'], _MESSAGE_PREVIEW_CHARS)}",
+                          str(ev["text"]), "loom")
     loud = [ev for ev in events if ev["speak"]]
     if len(events) > 3 and not loud:
         _push({"type": "notify", "msg": f"Loom: {len(events)} new events", "sound": "tap"})
@@ -304,7 +520,7 @@ def _ritual_tick() -> None:
         logger.info("evening digest (%d chars): %s", len(digest), digest[:160])
         _push({"type": "notify", "msg": "Evening digest — listen", "sound": "none"})
         with _lock:
-            _entries.appendleft(f"{now.strftime('%H:%M')} *: evening digest")
+            _append_entry(f"{now.strftime('%H:%M')} *: evening digest", digest, "assistant")
         url = _say_url(digest)
         if url and _link is not None:
             _link.send({"type": "say", "url": url})
@@ -319,19 +535,136 @@ def _payload() -> dict:
     jobs = _jobs.status() if _jobs else {"job_state": "idle", "job_label": ""}
     with _lock:
         running = 1 if _turns or jobs.get("job_state") in ("running", "paused") else 0
-        return {
+        payload = {
             "type": "state",
             "total": _stats["total"],
             "running": running,
             "waiting": len(_pending),
             "msg": _msg,
             "entries": list(_entries)[:5],
+            "entry_ids": _entry_id_snapshot(0, 5),
             "tokens_today": _stats["tokens_today"],
             "tools_today": _stats["tools_today"],
             "battery_v": round(float(_telemetry.get("bat") or 0.0), 2),
             "transport": getattr(_link, "transport", "none") if _link is not None else "none",
             **jobs,
         }
+        markdown = _agent_response_markdown
+        markdown_truncated = _agent_response_markdown_truncated
+    payload = _fit_message_previews(
+        payload, "entries",
+        reserve={"msg_markdown": _MARKDOWN_CLIPPED_MARKER,
+                 "msg_markdown_truncated": True},
+    )
+    return _fit_markdown_state_frame(payload, markdown, markdown_truncated)
+
+
+def _utf8_prefix(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Return a valid UTF-8 prefix within *max_bytes* and whether text was cut."""
+    pieces: list[str] = []
+    used = 0
+    for char in text:
+        # Replace unpaired surrogates, which cannot be represented in UTF-8.
+        if 0xD800 <= ord(char) <= 0xDFFF:
+            char = "\ufffd"
+        width = len(char.encode("utf-8"))
+        if used + width > max_bytes:
+            return "".join(pieces), True
+        pieces.append(char)
+        used += width
+    return "".join(pieces), False
+
+
+def _wire_json_size(frame: dict) -> int:
+    # SerialLink uses json.dumps with default ensure_ascii=True. Measure those
+    # exact bytes because Cyrillic and emoji expand to \u escapes on the wire.
+    return len(json.dumps(frame, separators=(",", ":"), ensure_ascii=True).encode("ascii"))
+
+
+def _fit_markdown_state_frame(base: dict, markdown: str, was_truncated: bool) -> dict:
+    """Add a codepoint-safe optional field while respecting USB/TCP line size."""
+    marker_bytes = len(_MARKDOWN_CLIPPED_MARKER.encode("utf-8"))
+
+    def candidate(chars: int, clipped: bool) -> dict:
+        frame = dict(base)
+        prefix = markdown[:chars]
+        if clipped:
+            prefix, _ = _utf8_prefix(prefix, _MAX_AGENT_MARKDOWN_BYTES - marker_bytes)
+            frame["msg_markdown"] = prefix + _MARKDOWN_CLIPPED_MARKER
+            frame["msg_markdown_truncated"] = True
+        else:
+            frame["msg_markdown"] = prefix
+            frame["msg_markdown_truncated"] = False
+        return frame
+
+    markdown, cap_truncated = _utf8_prefix(markdown, _MAX_AGENT_MARKDOWN_BYTES)
+    clipped = was_truncated or cap_truncated
+    full = candidate(len(markdown), clipped)
+    if _wire_json_size(full) <= _MAX_DEVICE_JSON_BYTES:
+        return full
+
+    # Search by Python codepoints; each candidate is escaped and measured as a
+    # complete frame, including current entries, job fields, and JSON overhead.
+    low, high = 0, len(markdown)
+    best = None
+    while low <= high:
+        middle = (low + high) // 2
+        frame = candidate(middle, True)
+        if _wire_json_size(frame) <= _MAX_DEVICE_JSON_BYTES:
+            best = frame
+            low = middle + 1
+        else:
+            high = middle - 1
+    if best is not None:
+        return best
+
+    # If the non-Markdown payload itself consumes the line budget, preserve the
+    # state fields needed to keep the familiar alive and clear the old response
+    # instead of returning an overlong frame or leaving stale Markdown visible.
+    frame = {
+        "type": "state",
+        "total": base.get("total", 0),
+        "running": base.get("running", 0),
+        "waiting": base.get("waiting", 0),
+    }
+    preview, _ = _utf8_prefix(str(base.get("msg", "")), 256)
+    frame["msg"] = preview
+    frame["msg_markdown"] = ""
+    frame["msg_markdown_truncated"] = True
+    if _wire_json_size(frame) > _MAX_DEVICE_JSON_BYTES:
+        # This can only happen if future protocol code changes the core fields
+        # to unbounded values; fail closed rather than violate line framing.
+        frame = {"type": "state", "total": 0, "running": 0, "waiting": 0,
+                 "msg": "", "msg_markdown": "", "msg_markdown_truncated": True}
+    return frame
+
+
+def _fit_message_previews(frame: dict, field: str, reserve: dict | None = None) -> dict:
+    """Shorten preview strings as needed while preserving rows and parallel IDs."""
+    values = frame.get(field)
+    def fits(candidate: dict) -> bool:
+        return _wire_json_size({**candidate, **(reserve or {})}) <= _MAX_DEVICE_JSON_BYTES
+
+    if not isinstance(values, list) or fits(frame):
+        return frame
+    strings = [str(value) for value in values]
+    low, high, best = 0, max((len(value) for value in strings), default=0), None
+    while low <= high:
+        chars = (low + high) // 2
+        candidate = dict(frame)
+        candidate[field] = [value[:chars] for value in strings]
+        if fits(candidate):
+            best = candidate
+            low = chars + 1
+        else:
+            high = chars - 1
+    if best is not None:
+        return best
+    # A non-preview field alone exceeds the frame budget. Empty every preview
+    # but retain row count and parallel IDs for the receiving UI.
+    fallback = dict(frame)
+    fallback[field] = [""] * len(strings)
+    return fallback
 
 
 def _push(extra: dict | None = None) -> None:
@@ -363,11 +696,12 @@ def _on_session_end(session_id="", **kw):
 
 
 def _on_pre_llm(platform="", session_id="", user_message="", **kw):
-    um = _actions.compact(str(user_message or ""), 70)
+    um = _actions.compact(str(user_message or ""), _MESSAGE_PREVIEW_CHARS)
     with _lock:
         _turns.add(str(session_id or "?"))
         if um:
-            _entries.appendleft(f"{datetime.now().strftime('%H:%M')} u: {um}")
+            _append_entry(f"{datetime.now().strftime('%H:%M')} u: {um}",
+                          str(user_message or ""), "user")
     _set_msg(f"thinking… ({platform})" if platform else "thinking…")
     if _link is not None:
         logger.info("push: thinking platform=%s connected=%s", platform, _link.connected)
@@ -385,15 +719,22 @@ def _on_post_tool(**kw):
 
 
 def _on_post_llm(assistant_response="", platform="", session_id="", **kw):
+    global _msg, _agent_response_markdown, _agent_response_markdown_truncated
+    raw = str(assistant_response or "")
+    text = _actions.compact(raw, 140)
+    src = str(platform or "").strip()
+    markdown = raw if text else ""
     with _lock:
         _turns.discard(str(session_id or "?"))
-    text = _actions.compact(str(assistant_response or ""), 140)
+        _agent_response_markdown, _agent_response_markdown_truncated = _utf8_prefix(
+            markdown, _MAX_AGENT_MARKDOWN_BYTES)
+        if text:
+            stamp = datetime.now().strftime("%H:%M")
+            _append_entry(f"{stamp} a: {_actions.compact(text, _MESSAGE_PREVIEW_CHARS)}", raw, "assistant")
+            _msg = text if not src else f"[{src}] {text}"[:140]
+        else:
+            _msg = "No text response"
     if text:
-        stamp = datetime.now().strftime("%H:%M")
-        src = str(platform or "").strip()
-        with _lock:
-            _entries.appendleft(f"{stamp} a: {_actions.compact(text, 70)}")
-        _set_msg(text if not src else f"[{src}] {text}"[:140])
         if _link is not None:
             logger.info("push: reply platform=%s len=%d connected=%s",
                         src, len(text), _link.connected)
@@ -437,14 +778,16 @@ def _on_post_approval(session_key="", choice="", **kw):
 
 def _on_kanban_claimed(task_id="", assignee="", **kw):
     with _lock:
-        _entries.appendleft(f"{datetime.now().strftime('%H:%M')} k: {assignee or 'worker'} claimed {task_id}")
+        preview = f"{datetime.now().strftime('%H:%M')} k: {assignee or 'worker'} claimed {task_id}"
+        _append_entry(preview)
     _push()
 
 
 def _on_kanban_completed(task_id="", summary="", **kw):
     note = _actions.compact(str(summary or task_id), 60)
     with _lock:
-        _entries.appendleft(f"{datetime.now().strftime('%H:%M')} k: done {note}")
+        _append_entry(f"{datetime.now().strftime('%H:%M')} k: done {note}",
+                      str(summary or task_id), "worker")
     _push()
 
 
@@ -515,10 +858,17 @@ def _handle_device_line(evt: dict, origin: str = "usb") -> None:
         with _lock:
             total = len(_entries)
             off = min(off, max(0, total - 1))
+            _sync_entry_ids()
             lines = list(_entries)[off:off + 5]
+            ids = list(_entry_ids)[off:off + 5]
         if _link is not None:
-            _link.send({"type": "msgs", "off": off, "total": total,
-                        "lines": [_actions.compact(l, 80) for l in lines]})
+            frame = {"type": "msgs", "off": off, "total": total,
+                     "lines": [_actions.compact(l, _MESSAGE_PREVIEW_CHARS) for l in lines],
+                     "ids": ids}
+            _link.send(_fit_message_previews(frame, "lines"))
+        return
+    if cmd == "msg":
+        _send_message_detail(str(evt.get("id") or ""), evt.get("offset", 0))
         return
     if cmd == "hello" or "hello" in evt:
         # device (re)booted — teach it where home is (for untethered TCP
@@ -546,12 +896,23 @@ def _handle_device_line(evt: dict, origin: str = "usb") -> None:
             _push(_jobs.cancel())
         return
     if cmd == "permission":
-        decision = str(evt.get("decision") or "once")
+        decision = str(evt.get("decision") or "")
         want = str(evt.get("id") or "")
+        if decision not in ("once", "deny"):
+            with _lock:
+                waiting = len(_pending)
+            _push({"type": "ack", "msg": "invalid approval decision",
+                   "waiting": waiting})
+            return
         with _lock:
-            key = want if want in _pending else (next(iter(_pending), ""))
+            # A stale/non-empty approval id must never fall through to another
+            # pending command. Only id-less legacy clients use FIFO selection.
+            key = want if want in _pending else (next(iter(_pending), "") if not want else "")
         if not key:
-            _push({"type": "ack", "msg": "no pending approval", "waiting": 0})
+            with _lock:
+                waiting = len(_pending)
+            _push({"type": "ack", "msg": "stale approval id" if want else "no pending approval",
+                   "waiting": waiting})
             return
         try:
             n = _actions._resolve_approval(key, decision)
@@ -685,7 +1046,8 @@ def _tool_notify(args=None, **kw) -> str:
     _link.send(desk_frame, leg="desk")
     _link.send(frame, leg="phone")
     with _lock:
-        _entries.appendleft(f"{datetime.now().strftime('%H:%M')} !: {_actions.compact(msg, 70)}")
+        _append_entry(f"{datetime.now().strftime('%H:%M')} !: {_actions.compact(msg, _MESSAGE_PREVIEW_CHARS)}",
+                      str(args.get("message") or ""), "notification")
     logger.info("push: notify len=%d sound=%s say=%s route=%s desk_quiet=%s",
                 len(msg), frame["sound"], frame.get("say", "-"),
                 _active_surface() or "everywhere", desk_quiet)
@@ -730,11 +1092,15 @@ def register(ctx) -> None:
     _voice_port = int(vc.get("port", 8765))
     _voice_cfg.update(vc)
     _voice.set_volume(vc.get("volume", 1.0))
+    _voice.configure_provider(
+        vc.get("provider", "hermes"), model=vc.get("model"),
+        voice=vc.get("voice"), language=vc.get("language"))
     _loom_cfg.update(cfg.get("loom") or {})
     _ritual_cfg.update(cfg.get("ritual") or {})
     _ctx["ctx"] = ctx
 
     if _is_gateway_process():
+        _seed_recent_messages()
         serial_cfg = cfg.get("serial") or {}
         _link = SerialLink(
             _handle_device_line,

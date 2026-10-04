@@ -7,6 +7,7 @@ one needs the gateway process.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -71,6 +72,8 @@ def wired(monkeypatch, tmp_path):
     familiar._turns.clear()
     familiar._pending.clear()
     familiar._entries.clear()
+    monkeypatch.setattr(familiar, "_agent_response_markdown", "")
+    monkeypatch.setattr(familiar, "_agent_response_markdown_truncated", False)
     familiar._presence.update({"desk": 0.0, "phone": 0.0})
     familiar._telemetry.clear()
     monkeypatch.setattr(familiar, "_desk_quiet", False)
@@ -86,6 +89,38 @@ def test_register_wires_hooks_and_command(wired):
         assert hook in ctx.hooks
     assert "familiar" in ctx.commands
     assert familiar._link is not None  # fake injected; real link is gateway-only
+
+
+def test_register_forwards_explicit_voice_provider_options(monkeypatch):
+    ctx = FakeCtx()
+    calls = []
+    monkeypatch.setattr(familiar, "_voice_cfg", {})
+    monkeypatch.setattr(familiar._actions, "load_config", lambda: {
+        "voice": {"provider": "vertex-gemini", "model": "gemini-2.5-flash-tts", "voice": "Kore"}
+    })
+    monkeypatch.setattr(familiar._voice, "configure_provider",
+                        lambda provider, **options: calls.append((provider, options)))
+
+    familiar.register(ctx)
+
+    assert calls == [("vertex-gemini", {
+        "model": "gemini-2.5-flash-tts", "voice": "Kore", "language": None
+    })]
+
+
+def test_register_forwards_yandex_voice_and_language_options(monkeypatch):
+    ctx = FakeCtx()
+    calls = []
+    monkeypatch.setattr(familiar, "_voice_cfg", {})
+    monkeypatch.setattr(familiar._actions, "load_config", lambda: {
+        "voice": {"provider": "yandex", "voice": "jane", "language": "en-US"}
+    })
+    monkeypatch.setattr(familiar._voice, "configure_provider",
+                        lambda provider, **options: calls.append((provider, options)))
+
+    familiar.register(ctx)
+
+    assert calls == [("yandex", {"model": None, "voice": "jane", "language": "en-US"})]
 
 
 def test_turn_lifecycle_drives_running_flag(wired):
@@ -105,7 +140,277 @@ def test_turn_lifecycle_drives_running_flag(wired):
     assert link.frames("event")[-1]["event"] == "message"
 
 
-def test_approval_flow_pushes_permission_and_resolves(wired, monkeypatch):
+def test_agent_reply_keeps_raw_markdown_separate_from_compact_preview(wired):
+    ctx, link = wired
+    raw = "## Привет\n\n**Жирный ответ** и [ссылка](https://example.test)\n\n```python\nprint('да')\n```"
+
+    ctx.hooks["post_llm_call"](assistant_response=raw, platform="telegram", session_id="md-1")
+
+    state = link.frames("state")[-1]
+    assert state["msg_markdown"] == raw
+    assert state["msg_markdown_truncated"] is False
+    assert "\n" not in state["msg"]
+    assert "## Привет" in state["msg"]
+    assert familiar._wire_json_size(state) <= familiar._MAX_DEVICE_JSON_BYTES
+
+
+def test_blank_new_response_clears_previous_latest_markdown(wired):
+    ctx, link = wired
+    ctx.hooks["post_llm_call"](assistant_response="**previous reply**", session_id="md-old")
+    ctx.hooks["post_llm_call"](assistant_response="\n \t", session_id="md-empty")
+
+    state = link.frames("state")[-1]
+    assert state["msg_markdown"] == ""
+    assert state["msg_markdown_truncated"] is False
+    assert state["msg"] == "No text response"
+
+
+def test_cyrillic_markdown_is_clipped_to_a_complete_utf8_prefix_and_wire_budget(wired):
+    ctx, link = wired
+    raw = ("### Заголовок\n\nТекст **важно** 🙂 и [ссылка](https://example.test/a?x=1&y=2)\n\n" * 500)
+
+    ctx.hooks["post_llm_call"](assistant_response=raw, platform="gateway", session_id="md-large")
+
+    state = link.frames("state")[-1]
+    markdown = state["msg_markdown"]
+    assert state["msg_markdown_truncated"] is True
+    assert markdown.endswith("\n\n[Response clipped]")
+    assert len(markdown.encode("utf-8")) <= familiar._MAX_AGENT_MARKDOWN_BYTES
+    assert familiar._wire_json_size(state) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert markdown.encode("utf-8").decode("utf-8") == markdown
+
+
+def test_markdown_budget_fallback_never_exceeds_device_line_limit():
+    base = {
+        "type": "state",
+        "total": 1,
+        "running": 0,
+        "waiting": 0,
+        "msg": "compact preview",
+        "job_label": "Ж" * 3000,
+        "entries": ["старый текст" * 300],
+    }
+    frame = familiar._fit_markdown_state_frame(base, "**response**", False)
+    assert familiar._wire_json_size(frame) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert frame["msg_markdown"] == ""
+    assert frame["msg_markdown_truncated"] is True
+    assert frame["type"] == "state"
+
+
+def test_selected_message_detail_keeps_full_text_and_fits_wire_frame(wired):
+    ctx, link = wired
+    user_text = "Привет 👋 " * 220
+    familiar._on_pre_llm(user_message=user_text, session_id="detail-test")
+    state = link.frames("state")[-1]
+    entry_id = state["entry_ids"][0]
+    familiar._handle_device_line({"cmd": "msg", "id": entry_id})
+
+    detail = link.frames("msg")[-1]
+    assert detail["id"] == entry_id
+    assert detail["role"] == "user"
+    assert detail["body"].startswith("Привет 👋")
+    assert detail["truncated"] is True
+    assert len(detail["body"]) < len(user_text)
+    assert familiar._wire_json_size(detail) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert detail["body"].encode("utf-8").decode("utf-8") == detail["body"]
+    assert detail["body_offset"] == 0
+    assert detail["body_total"] == len(user_text.encode("utf-8"))
+    assert detail["has_more"] is True
+    assert detail["truncated"] is True
+
+
+def test_message_detail_pages_reassemble_retained_utf8_body_with_truthful_cap_status(wired):
+    _, link = wired
+    raw = "Здравствуй 👋🙂 " * 2000
+    expected, retention_clipped = familiar._utf8_prefix(
+        raw, familiar._MAX_RETAINED_DETAIL_BYTES)
+    with familiar._lock:
+        entry_id = familiar._append_entry("long reply", raw, "assistant")
+
+    assembled = bytearray()
+    offset = 0
+    pages = 0
+    while True:
+        familiar._handle_device_line({"cmd": "msg", "id": entry_id, "offset": offset})
+        page = link.frames("msg")[-1]
+        assert page["id"] == entry_id
+        assert page["body_offset"] == offset
+        assert page["body_total"] == len(expected.encode("utf-8"))
+        assert page["retained_truncated"] is retention_clipped
+        assert familiar._wire_json_size(page) <= familiar._MAX_DEVICE_JSON_BYTES
+        encoded = page["body"].encode("utf-8")
+        assert encoded.decode("utf-8") == page["body"]
+        assembled.extend(encoded)
+        pages += 1
+        assert pages < 20
+        if not page["has_more"]:
+            assert page["truncated"] is retention_clipped
+            break
+        assert page["truncated"] is True
+        offset += len(encoded)
+
+    assert pages > 1
+    assert assembled.decode("utf-8") == expected
+    assert len(assembled) <= familiar._MAX_RETAINED_DETAIL_BYTES
+    assert retention_clipped is True
+
+
+@pytest.mark.parametrize("offset", [-1, True, 1, 16385, "2"])
+def test_message_detail_rejects_invalid_offsets_without_falling_back_to_preview(wired, offset):
+    _, link = wired
+    with familiar._lock:
+        entry_id = familiar._append_entry("safe preview", "🙂body", "assistant")
+
+    familiar._handle_device_line({"cmd": "msg", "id": entry_id, "offset": offset})
+    detail = link.frames("msg")[-1]
+    assert detail["error"] == "offset"
+    assert detail["body"] == ""
+    assert detail["has_more"] is False
+
+
+def test_message_ids_follow_duplicate_previews_and_stale_ids_do_not_substitute(wired):
+    _, link = wired
+    repeated = "same assistant response"
+    familiar._on_post_llm(assistant_response=repeated)
+    first_state = link.frames("state")[-1]
+    first_id = first_state["entry_ids"][0]
+
+    familiar._on_post_llm(assistant_response=repeated)
+    state = link.frames("state")[-1]
+    second_id = state["entry_ids"][0]
+    assert state["entries"][0] == first_state["entries"][0]
+    assert second_id != first_id
+
+    familiar._handle_device_line({"cmd": "msgs", "off": 0})
+    history = link.frames("msgs")[-1]
+    assert history["ids"][:2] == [second_id, first_id]
+    assert history["lines"][:2] == [state["entries"][0], state["entries"][1]]
+
+    for i in range(39):
+        familiar._on_post_llm(assistant_response=f"response {i}")
+    familiar._handle_device_line({"cmd": "msg", "id": first_id})
+    stale = link.frames("msg")[-1]
+    assert stale["id"] == first_id
+    assert stale["body"] == ""
+    assert stale["error"] == "stale"
+
+
+def test_unavailable_legacy_entry_detail_is_reported_without_preview_fallback(wired):
+    _, link = wired
+    with familiar._lock:
+        familiar._entries.appendleft("12:00 k: legacy preview")
+    state = familiar._payload()
+    entry_id = state["entry_ids"][0]
+    familiar._handle_device_line({"cmd": "msg", "id": entry_id})
+    detail = link.frames("msg")[-1]
+    assert detail["error"] == "unavailable"
+    assert detail["body"] == ""
+
+
+def test_unicode_previews_preserve_five_state_and_history_ids_under_frame_cap(wired):
+    _, link = wired
+    inserted_ids = []
+    bodies = {}
+    with familiar._lock:
+        for i in range(5):
+            body = f"full retained body {i}"
+            entry_id = familiar._append_entry(f"Ж👋{i}" * 80, body, "user")
+            inserted_ids.append(entry_id)
+            bodies[entry_id] = body
+
+    state = familiar._payload()
+    expected_ids = list(reversed(inserted_ids))
+    assert state["entry_ids"] == expected_ids
+    assert len(state["entries"]) == len(state["entry_ids"]) == 5
+    assert all(len(preview) < 240 for preview in state["entries"])
+    assert familiar._wire_json_size(state) <= familiar._MAX_DEVICE_JSON_BYTES
+
+    familiar._handle_device_line({"cmd": "msgs", "off": 0})
+    history = link.frames("msgs")[-1]
+    assert len(history["lines"]) == len(history["ids"]) == 5
+    assert history["ids"] == expected_ids
+    assert familiar._wire_json_size(history) <= familiar._MAX_DEVICE_JSON_BYTES
+    assert all(familiar._entry_details[entry_id]["body"] == body
+               for entry_id, body in bodies.items())
+
+
+def test_message_card_preview_limit_supports_two_lines(wired):
+    ctx, link = wired
+    ctx.hooks["pre_llm_call"](user_message="A" * 500, session_id="long-preview")
+
+    state = link.frames("state")[-1]
+    preview = state["entries"][0]
+    assert len(preview) > 70
+    assert len(preview) <= len("HH:MM u: ") + familiar._MESSAGE_PREVIEW_CHARS
+    assert familiar._wire_json_size(state) <= familiar._MAX_DEVICE_JSON_BYTES
+
+    familiar._handle_device_line({"cmd": "msgs", "off": 0})
+    history = link.frames("msgs")[-1]
+    assert len(history["lines"][0]) > 70
+    assert familiar._wire_json_size(history) <= familiar._MAX_DEVICE_JSON_BYTES
+
+
+def test_gateway_history_seed_is_read_only_ordered_filtered_and_bounded(wired, tmp_path):
+    _, _link = wired
+    db = tmp_path / "state.db"
+    now = time.time()
+    con = sqlite3.connect(db)
+    con.executescript("""
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT);
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+            content TEXT, timestamp REAL
+        );
+        INSERT INTO sessions VALUES ('s', 'test', 'seed');
+    """)
+    rows = []
+    for i in range(45):
+        role = "user" if i % 2 == 0 else "assistant"
+        content = "🙂" * 5000 if i == 44 else f"message {i}"
+        rows.append((i, "s", role, content, now - (44 - i)))
+    rows.extend([
+        (100, "s", "tool", "ignored role", now),
+        (101, "s", "user", "   ", now),
+        (102, "s", "assistant",
+         "[IMPORTANT: You are running as a scheduled cron job. hidden prompt", now),
+        (103, "s", "user", "too old", now - 25 * 3600),
+    ])
+    con.executemany(
+        "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", rows)
+    con.commit()
+    before = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    con.close()
+
+    seeded = familiar._seed_recent_messages(db)
+
+    assert seeded == 40
+    assert len(familiar._entries) == 40
+    assert "message 44" not in familiar._entries[0]  # latest row has a long body
+    assert familiar._entries[0].endswith("u: " + "🙂" * 199 + "…")
+    assert "message 5" in familiar._entries[-1]
+    latest_id = familiar._entry_ids[0]
+    latest_detail = familiar._entry_details[latest_id]
+    assert latest_detail["role"] == "user"
+    assert latest_detail["truncated"] is True
+    assert len(latest_detail["body"].encode("utf-8")) <= familiar._MAX_RETAINED_DETAIL_BYTES
+    assert familiar._entry_details[familiar._entry_ids[-1]]["body"] == "message 5"
+
+    original_entries = list(familiar._entries)
+    original_ids = list(familiar._entry_ids)
+    assert familiar._seed_recent_messages(db) == 0
+    assert list(familiar._entries) == original_entries
+    assert list(familiar._entry_ids) == original_ids
+    with sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True) as check:
+        assert check.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == before
+
+
+def test_gateway_history_seed_missing_database_is_safe(wired, tmp_path):
+    assert familiar._seed_recent_messages(tmp_path / "missing.db") == 0
+    assert not familiar._entries
+
+
+@pytest.mark.parametrize("decision", ["once", "deny"])
+def test_approval_flow_pushes_permission_and_resolves(wired, monkeypatch, decision):
     ctx, link = wired
     ctx.hooks["pre_approval_request"](command="rm -rf /tmp/x",
                                       description="Recursive delete",
@@ -118,10 +423,10 @@ def test_approval_flow_pushes_permission_and_resolves(wired, monkeypatch):
     calls = []
     monkeypatch.setattr(actions, "_resolve_approval",
                         lambda key, choice: calls.append((key, choice)) or 1)
-    familiar._handle_device_line({"cmd": "permission", "decision": "deny", "id": "sess-9"})
-    assert calls == [("sess-9", "deny")]
+    familiar._handle_device_line({"cmd": "permission", "decision": decision, "id": "sess-9"})
+    assert calls == [("sess-9", decision)]
 
-    ctx.hooks["post_approval_response"](session_key="sess-9", choice="deny")
+    ctx.hooks["post_approval_response"](session_key="sess-9", choice=decision)
     assert link.frames("state")[-1]["waiting"] == 0
 
 
@@ -129,6 +434,51 @@ def test_device_permission_with_no_pending_is_acked(wired):
     _, link = wired
     familiar._handle_device_line({"cmd": "permission", "decision": "once"})
     assert link.sent[-2]["msg"] == "no pending approval"
+
+
+@pytest.mark.parametrize("evt", [
+    {"cmd": "permission", "id": "current-approval"},
+    {"cmd": "permission", "decision": None, "id": "current-approval"},
+    {"cmd": "permission", "decision": "", "id": "current-approval"},
+    {"cmd": "permission", "decision": False, "id": "current-approval"},
+    {"cmd": "permission", "decision": ["once"], "id": "current-approval"},
+    {"cmd": "permission", "decision": {"choice": "once"}, "id": "current-approval"},
+    {"cmd": "permission", "decision": "allow", "id": "current-approval"},
+])
+def test_device_permission_rejects_missing_or_unsupported_decision(wired, monkeypatch, evt):
+    ctx, link = wired
+    ctx.hooks["pre_approval_request"](command="deploy production",
+                                      description="Production deploy",
+                                      session_key="current-approval", surface="gateway")
+    calls = []
+    monkeypatch.setattr(actions, "_resolve_approval",
+                        lambda key, choice: calls.append((key, choice)) or 1)
+
+    familiar._handle_device_line(evt)
+
+    assert calls == []
+    assert familiar._pending == {"current-approval": "Production deploy"}
+    assert link.sent[-2]["type"] == "ack"
+    assert link.sent[-2]["msg"] == "invalid approval decision"
+    assert link.sent[-2]["waiting"] == 1
+
+
+def test_device_permission_with_stale_id_does_not_resolve_another_approval(wired, monkeypatch):
+    ctx, link = wired
+    ctx.hooks["pre_approval_request"](command="deploy production",
+                                      description="Production deploy",
+                                      session_key="current-approval", surface="gateway")
+    calls = []
+    monkeypatch.setattr(actions, "_resolve_approval",
+                        lambda key, choice: calls.append((key, choice)) or 1)
+
+    familiar._handle_device_line({"cmd": "permission", "decision": "once", "id": "stale-approval"})
+
+    assert calls == []
+    assert familiar._pending == {"current-approval": "Production deploy"}
+    assert link.sent[-2]["type"] == "ack"
+    assert link.sent[-2]["msg"] == "stale approval id"
+    assert link.sent[-2]["waiting"] == 1
 
 
 def test_deck_frame_shapes_buttons():

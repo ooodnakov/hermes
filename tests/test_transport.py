@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from plugin import serial_link
 from plugin.serial_link import SerialLink
 
 TOKEN = "test-token-123"
@@ -94,6 +96,166 @@ def test_tcp_auth_roundtrip():
     assert wait_for(lambda: not link._net_clients)
 
 
+def test_tcp_malformed_frame_recovers_and_client_can_reconnect():
+    link, seen = make_link()
+    port = link.start_tcp(0, token=TOKEN)
+
+    first = tcp_connect(port)
+    first.sendall(json.dumps({"type": "auth", "token": TOKEN}).encode() + b"\n")
+    assert json.loads(readline(first)) == {"type": "auth", "ok": True}
+    assert wait_for(lambda: len(link._net_clients) == 1)
+    first.sendall(b'{"cmd":\nnot-json\n{"cmd":"deck","i":2}\n')
+    assert wait_for(lambda: seen == [{"cmd": "deck", "i": 2}])
+    first.close()
+    assert wait_for(lambda: not link._net_clients)
+
+    second = tcp_connect(port)
+    second.sendall(json.dumps({"type": "auth", "token": TOKEN}).encode() + b"\n")
+    assert json.loads(readline(second)) == {"type": "auth", "ok": True}
+    assert wait_for(lambda: len(link._net_clients) == 1)
+    second.sendall(b'{"cmd":"deck","i":3}\n')
+    assert wait_for(lambda: seen == [{"cmd": "deck", "i": 2}, {"cmd": "deck", "i": 3}])
+    second.close()
+    assert wait_for(lambda: not link._net_clients)
+
+
+def test_tcp_discards_oversized_line_and_recovers_at_payload_boundary():
+    link, seen = make_link()
+    port = link.start_tcp(0)
+    s = tcp_connect(port)
+
+    # 4095 payload bytes is accepted by the framer (though not valid JSON).
+    s.sendall(b" " * serial_link._MAX_PAYLOAD_BYTES + b"\n")
+    s.sendall(b"x" * (serial_link._MAX_PAYLOAD_BYTES + 1)
+              + b'{"cmd":"hidden"}\n')
+    s.sendall(b'{"cmd":"deck","i":4}\n')
+
+    assert wait_for(lambda: seen == [{"cmd": "deck", "i": 4}])
+    s.close()
+    link.stop()
+
+
+def test_tcp_oversized_auth_is_rejected_without_parsing_suffix():
+    link, seen = make_link()
+    port = link.start_tcp(0, token=TOKEN)
+    s = tcp_connect(port)
+    suffix = json.dumps({"type": "auth", "token": TOKEN}).encode()
+    s.sendall(b"x" * (serial_link._MAX_PAYLOAD_BYTES + 1) + suffix + b"\n")
+    assert readline(s) == b""
+    assert seen == []
+    assert link._net_clients == []
+    s.close()
+    link.stop()
+
+
+def test_tcp_idle_unauthenticated_connection_times_out(monkeypatch):
+    monkeypatch.setattr(serial_link, "_AUTH_TIMEOUT_SECS", 0.1)
+    link, _seen = make_link()
+    port = link.start_tcp(0, token=TOKEN)
+    s = tcp_connect(port)
+
+    assert wait_for(lambda: readline(s) == b"", timeout=1)
+    assert link._net_clients == []
+    s.close()
+    link.stop()
+
+
+def test_stop_closes_listener_and_connected_clients():
+    link, _seen = make_link()
+    port = link.start_tcp(0)
+    s = tcp_connect(port)
+    s.sendall(b'{"hello":"hermes-buddy"}\n')
+    assert wait_for(lambda: link._net_clients)
+
+    link.stop()
+
+    assert wait_for(lambda: not link._net_clients)
+    assert readline(s) == b""
+    with pytest.raises(OSError):
+        tcp_connect(port)
+    s.close()
+
+def test_slow_network_sender_is_isolated_from_other_clients(monkeypatch):
+    monkeypatch.setattr(serial_link, "_NET_SEND_QUEUE_SIZE", 1)
+    link, _seen = make_link()
+    blocked = threading.Event()
+    release = threading.Event()
+    disconnected = threading.Event()
+    received = []
+
+    def slow_write(_data):
+        blocked.set()
+        release.wait(timeout=2)
+
+    slow = serial_link._queued_sender(slow_write, disconnected.set)
+    link._net_add("tcp", slow, "slow-peer")
+    link._net_add("tcp", received.append, "fast-peer")
+
+    link._net_send(b"first\n")
+    assert blocked.wait(timeout=1)
+    link._net_send(b"queued\n")
+    link._net_send(b"overflow\n")
+
+    assert disconnected.wait(timeout=1)
+    assert received == [b"first\n", b"queued\n", b"overflow\n"]
+    assert wait_for(lambda: link.peers() == [("tcp", "fast-peer")])
+    release.set()
+
+
+def test_failed_network_write_removes_peer_and_keeps_broadcasting():
+    link, _seen = make_link()
+    received = []
+
+    def broken_write(_data):
+        raise OSError("peer disconnected")
+
+    broken = serial_link._queued_sender(broken_write, lambda: None, link._net_del)
+    link._net_add("tcp", broken, "broken-peer")
+    link._net_add("tcp", received.append, "healthy-peer")
+
+    link._net_send(b"fails asynchronously\n")
+    assert wait_for(lambda: link.peers() == [("tcp", "healthy-peer")])
+    link._net_send(b"still delivered\n")
+
+    assert received == [b"fails asynchronously\n", b"still delivered\n"]
+
+
+def test_slow_disconnect_does_not_block_broadcast(monkeypatch):
+    monkeypatch.setattr(serial_link, "_NET_SEND_QUEUE_SIZE", 1)
+    link, _seen = make_link()
+    blocked = threading.Event()
+    release_write = threading.Event()
+    disconnect_entered = threading.Event()
+    release_disconnect = threading.Event()
+    received = []
+
+    def slow_write(_data):
+        blocked.set()
+        release_write.wait(timeout=2)
+
+    def slow_disconnect():
+        disconnect_entered.set()
+        release_disconnect.wait(timeout=2)
+
+    slow = serial_link._queued_sender(slow_write, slow_disconnect, link._net_del)
+    link._net_add("tcp", slow, "slow-peer")
+    link._net_add("tcp", received.append, "fast-peer")
+    link._net_send(b"first\n")
+    assert blocked.wait(timeout=1)
+    link._net_send(b"queued\n")
+
+    started = time.monotonic()
+    link._net_send(b"overflow\n")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert disconnect_entered.wait(timeout=1)
+    assert received == [b"first\n", b"queued\n", b"overflow\n"]
+    assert wait_for(lambda: link.peers() == [("tcp", "fast-peer")])
+    release_write.set()
+    release_disconnect.set()
+
+
 def test_welcome_snapshot_on_connect():
     # fresh clients get on_client() frames right after auth — the broadcast
     # only carries what happens after they join
@@ -106,6 +268,43 @@ def test_welcome_snapshot_on_connect():
     assert json.loads(readline(s))["type"] == "deck"
     assert json.loads(readline(s))["type"] == "state"
     s.close()
+
+
+def test_tcp_only_link_keeps_sending_state_heartbeats():
+    """A device on TCP with no USB serial must stay live past the UI timeout."""
+    link, _seen = make_link()
+    link._heartbeat = 0.05
+    link._make_heartbeat = lambda: {"type": "state", "running": 0, "waiting": 0}
+    # Force the actual _run no-USB branch without probing workstation ports.
+    link._connect = lambda: None
+    port = link.start_tcp(0)
+    s = tcp_connect(port)
+    s.settimeout(0.1)
+    assert wait_for(lambda: len(link._net_clients) == 1)
+    link.start()
+    try:
+        states = []
+        buf = b""
+        deadline = time.time() + 3.3
+        while time.time() < deadline:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                frame = json.loads(line)
+                if frame.get("type") == "state":
+                    states.append(frame)
+        assert len(states) >= 3
+        assert link._ser is None
+        assert len(link._net_clients) == 1
+    finally:
+        link.stop()
+        s.close()
 
 
 def test_tcp_no_token_is_open_backcompat():
@@ -154,6 +353,17 @@ def test_ws_auth_roundtrip():
         assert wait_for(lambda: seen)
         assert seen[0] == {"cmd": "deck", "i": 0}
     assert wait_for(lambda: not link._net_clients)
+
+
+def test_ws_malformed_frame_recovers():
+    ws_client = _ws_client()
+    link, seen = make_link()
+    port = link.start_ws(0)
+    with ws_client.connect(f"ws://127.0.0.1:{port}") as conn:
+        conn.send('{"cmd":')
+        conn.send('{"cmd":"deck","i":5}')
+        assert wait_for(lambda: seen == [{"cmd": "deck", "i": 5}])
+    link.stop()
 
 
 def test_ws_and_tcp_share_broadcast():

@@ -1,0 +1,1221 @@
+#include "familiar_ui.h"
+
+#include <ArduinoJson.h>
+#include <cstdio>
+#include <stdlib.h>
+#include <array>
+#include <string_view>
+
+#include "emoji_text.h"
+
+namespace ui {
+namespace {
+constexpr const char* kTabs[] = {"FACE", "MSGS", "OPS", "FLEET", "CRON", "NET", "DEV", "SET"};
+constexpr int16_t kContentX = 8, kContentRight = 632;
+constexpr int16_t kApprovalTop = 130, kApprovalHeight = 36;
+
+uint16_t pageIndex(protocol::Page page) { return static_cast<uint16_t>(page); }
+
+std::string_view textView(const String& text) {
+  return std::string_view(text.c_str(), text.length());
+}
+
+uint8_t utf8SequenceLength(uint8_t lead) {
+  if ((lead & 0xe0) == 0xc0) return 2;
+  if ((lead & 0xf0) == 0xe0) return 3;
+  if ((lead & 0xf8) == 0xf0) return 4;
+  return 1;
+}
+
+String utf8Glyph(const String& text, uint16_t offset, uint16_t& next) {
+  const uint8_t lead = static_cast<uint8_t>(text[offset]);
+  const uint8_t length = utf8SequenceLength(lead);
+  next = static_cast<uint16_t>(offset + 1);
+  if (length > 1) {
+    while (next < text.length() && next < offset + length &&
+           (static_cast<uint8_t>(text[next]) & 0xc0) == 0x80) ++next;
+  }
+  return text.substring(offset, next);
+}
+
+String plainText(const String& source) {
+  String result;
+  bool previousNewline = false;
+  for (uint16_t i = 0; i < source.length();) {
+    const unsigned char c = static_cast<unsigned char>(source[i]);
+    if (c == '\r') { ++i; continue; }
+    if (c < 0x20 && c != '\n' && c != '\t') { ++i; continue; }
+    if (c == '\t') { result += " "; ++i; continue; }
+    if (c == '\n') {
+      if (!previousNewline) result += "\n";
+      previousNewline = true;
+      ++i;
+      continue;
+    }
+    uint16_t next = i;
+    const String glyph = utf8Glyph(source, i, next);
+    result += glyph;
+    i = next;
+    previousNewline = false;
+  }
+  return result;
+}
+
+uint32_t markdownHash(const String& source) {
+  uint32_t hash = 2166136261u;
+  for (uint16_t i = 0; i < source.length(); ++i) {
+    hash ^= static_cast<uint8_t>(source[i]);
+    hash *= 16777619u;
+  }
+  return hash ^ source.length();
+}
+
+bool ensureMarkdownParsed(const String& source, markdown::Document& document,
+                          uint32_t& cachedHash, bool& ready) {
+  const uint32_t hash = markdownHash(source);
+  if (ready && hash == cachedHash) return true;
+  document.clear();
+  ready = markdown::parsePrefix(textView(source), document);
+  cachedHash = hash;
+  return ready;
+}
+
+struct MarkdownColors {
+  uint16_t background;
+  uint16_t panel;
+  uint16_t green;
+  uint16_t amber;
+  uint16_t cyan;
+};
+
+void drawMarkdownRegion(lgfx::LGFX_Sprite& sprite, const markdown::Document& document,
+                        Rect rect, float scale, uint16_t& scroll,
+                        const MarkdownColors& colors) {
+  if (rect.w <= 0 || rect.h <= 0 || scale < 1.0f) return;
+  int32_t clipX = 0, clipY = 0, clipW = 0, clipH = 0;
+  sprite.getClipRect(&clipX, &clipY, &clipW, &clipH);
+  const int32_t left = std::max<int32_t>(rect.x, clipX);
+  const int32_t top = std::max<int32_t>(rect.y, clipY);
+  const int32_t right = std::min<int32_t>(rect.x + rect.w, clipX + clipW);
+  const int32_t bottom = std::min<int32_t>(rect.y + rect.h, clipY + clipH);
+  if (right <= left || bottom <= top) return;
+  sprite.setClipRect(left, top, right - left, bottom - top);
+
+  sprite.setFont(&fonts::efontJA_12);
+  sprite.setTextWrap(false);
+  sprite.setTextSize(scale);
+  const int16_t lineHeight = static_cast<int16_t>(sprite.fontHeight()) + 1;
+  const uint16_t visibleLines = static_cast<uint16_t>(std::max<int16_t>(1, rect.h / lineHeight));
+
+  for (uint8_t pass = 0; pass < 2; ++pass) {
+    uint16_t lineNumber = 0;
+    bool hasBlock = false;
+    bool atLineStart = true;
+    bool currentCodeBlock = false;
+    uint8_t currentHeadingLevel = 0;
+    int16_t indentX = rect.x;
+    int16_t cursorX = rect.x;
+    int16_t runX = rect.x;
+    int16_t runWidth = 0;
+    uint16_t runLine = 0;
+    uint8_t runStyle = markdown::Plain;
+    bool runActive = false;
+    String run;
+
+    auto lineVisible = [&](uint16_t number) {
+      return number >= scroll && number < scroll + visibleLines;
+    };
+    auto lineY = [&](uint16_t number) {
+      return static_cast<int16_t>(rect.y + (number - scroll) * lineHeight);
+    };
+    auto fontFor = [](uint8_t style) -> const lgfx::IFont* {
+      const bool bold = (style & markdown::Bold) != 0;
+      const bool italic = (style & markdown::Italic) != 0;
+      if (bold && italic) return &fonts::efontJA_12_bi;
+      if (bold) return &fonts::efontJA_12_b;
+      if (italic) return &fonts::efontJA_12_i;
+      return &fonts::efontJA_12;
+    };
+    auto flushRun = [&]() {
+      if (!runActive || pass == 0 || !lineVisible(runLine)) {
+        run = ""; runActive = false; runWidth = 0;
+        return;
+      }
+      const int16_t y = lineY(runLine);
+      const bool inlineCode = (runStyle & markdown::InlineCode) != 0;
+      const bool link = (runStyle & markdown::Link) != 0;
+      uint16_t foreground = currentCodeBlock || inlineCode ? colors.cyan : colors.green;
+      if (link) foreground = colors.cyan;
+      if (currentHeadingLevel && !inlineCode && !currentCodeBlock) foreground = colors.amber;
+      if (inlineCode && !currentCodeBlock)
+        sprite.fillRoundRect(runX, y, runWidth, lineHeight, 2, colors.panel);
+      sprite.setFont(fontFor(runStyle | (currentHeadingLevel ? markdown::Bold : markdown::Plain)));
+      sprite.setTextWrap(false);
+      sprite.setTextSize(scale);
+      const uint16_t background = inlineCode || currentCodeBlock ? colors.panel : colors.background;
+      emoji_text::draw(sprite, textView(run), runX, y, foreground, background, scale);
+      if (link) sprite.drawFastHLine(runX, y + lineHeight - 2, runWidth, colors.cyan);
+      run = ""; runActive = false; runWidth = 0;
+    };
+    auto beginLine = [&]() {
+      cursorX = indentX;
+      atLineStart = true;
+      if (pass == 1 && currentCodeBlock && lineVisible(lineNumber))
+        sprite.fillRoundRect(rect.x, lineY(lineNumber), rect.w, lineHeight, 2, colors.panel);
+    };
+    auto nextLine = [&]() {
+      flushRun();
+      ++lineNumber;
+      beginLine();
+    };
+
+    for (const markdown::Block& block : document.blocks) {
+      if (block.kind == markdown::BlockKind::Blank || block.spanCount == 0) continue;
+      if (hasBlock && !atLineStart) {
+        flushRun();
+        ++lineNumber;
+        cursorX = rect.x;
+        atLineStart = true;
+      }
+      currentCodeBlock = block.kind == markdown::BlockKind::CodeBlock;
+      currentHeadingLevel = block.kind == markdown::BlockKind::Heading ? block.headingLevel : 0;
+      indentX = rect.x;
+      if (block.kind == markdown::BlockKind::BulletItem ||
+          block.kind == markdown::BlockKind::OrderedItem) {
+        char marker[16];
+        if (block.kind == markdown::BlockKind::OrderedItem)
+          snprintf(marker, sizeof(marker), "%u. ", block.listNumber);
+        else snprintf(marker, sizeof(marker), "- ");
+        const String prefix(marker);
+        sprite.setFont(&fonts::efontJA_12_b);
+        sprite.setTextSize(scale);
+        const int16_t prefixWidth = static_cast<int16_t>(sprite.textWidth(prefix));
+        if (pass == 1 && lineVisible(lineNumber)) {
+          const int16_t y = lineY(lineNumber);
+          sprite.setTextColor(colors.amber, colors.background);
+          sprite.setCursor(rect.x, y);
+          sprite.print(prefix);
+        }
+        indentX = static_cast<int16_t>(rect.x + prefixWidth);
+      }
+      beginLine();
+
+      for (uint16_t spanIndex = block.firstSpan;
+           spanIndex < block.firstSpan + block.spanCount; ++spanIndex) {
+        const markdown::Span& span = document.spans[spanIndex];
+        const std::string_view spanText(document.text.data() + span.textBegin, span.textLength);
+        for (size_t offset = 0; offset < spanText.size();) {
+          size_t tokenOffset = offset;
+          emoji_text::Token token;
+          if (!emoji_text::nextToken(spanText, tokenOffset, token)) break;
+          const size_t next = token.end;
+          const std::string glyphBytes(spanText.substr(offset, next - offset));
+          const String glyph(glyphBytes.c_str());
+          offset = next;
+          if (glyph == "\n") { nextLine(); continue; }
+          if (atLineStart && glyph == " " && !currentCodeBlock) continue;
+          const uint8_t style = static_cast<uint8_t>(span.style |
+              (currentHeadingLevel ? markdown::Bold : markdown::Plain));
+          sprite.setFont(fontFor(style));
+          sprite.setTextSize(scale);
+          const int16_t glyphWidth = emoji_text::tokenWidth(sprite, spanText, token, scale);
+          if (cursorX + glyphWidth > rect.x + rect.w && cursorX > indentX) nextLine();
+          if (atLineStart && glyph == " " && !currentCodeBlock) continue;
+          if (!runActive || runStyle != span.style || runLine != lineNumber ||
+              runX + runWidth != cursorX) {
+            flushRun();
+            runX = cursorX;
+            runLine = lineNumber;
+            runStyle = span.style;
+            runActive = true;
+          }
+          run += glyph;
+          runWidth = static_cast<int16_t>(runWidth + glyphWidth);
+          cursorX = static_cast<int16_t>(cursorX + glyphWidth);
+          atLineStart = false;
+        }
+      }
+      flushRun();
+      hasBlock = true;
+    }
+    flushRun();
+    const uint16_t totalLines = hasBlock ? static_cast<uint16_t>(lineNumber + 1) : 0;
+    if (pass == 0) {
+      const uint16_t maxScroll = totalLines > visibleLines ? totalLines - visibleLines : 0;
+      if (scroll > maxScroll) scroll = maxScroll;
+    }
+  }
+  sprite.setClipRect(clipX, clipY, clipW, clipH);
+}
+
+uint16_t countWrappedLines(lgfx::LGFX_Sprite& sprite, const String& source,
+                           int16_t width, float size = 1.0f) {
+  const String text = plainText(source);
+  sprite.setFont(&fonts::efontJA_12);
+  sprite.setTextWrap(false);
+  sprite.setTextSize(size);
+  uint16_t lines = 0;
+  uint16_t offset = 0;
+  while (offset < text.length()) {
+    if (text[offset] == '\n') { ++lines; ++offset; continue; }
+    while (offset < text.length() && text[offset] == ' ') ++offset;
+    if (offset >= text.length()) break;
+    const uint16_t start = offset;
+    uint16_t fitEnd = start;
+    uint16_t lastSpace = UINT16_MAX;
+    uint16_t scan = start;
+    while (scan < text.length() && text[scan] != '\n') {
+      emoji_text::Token token;
+      size_t tokenOffset = scan;
+      if (!emoji_text::nextToken(textView(text), tokenOffset, token)) break;
+      const uint16_t next = static_cast<uint16_t>(token.end);
+      const String glyph = text.substring(scan, next);
+      if (emoji_text::measure(sprite, textView(text).substr(start, next - start), size) > width) break;
+      if (glyph == " ") lastSpace = scan;
+      fitEnd = next;
+      scan = next;
+    }
+    if (fitEnd == start) {
+      size_t tokenOffset = start;
+      emoji_text::Token token;
+      if (emoji_text::nextToken(textView(text), tokenOffset, token))
+        fitEnd = static_cast<uint16_t>(token.end);
+    }
+    offset = fitEnd;
+    if (scan < text.length() && text[scan] != '\n' && lastSpace != UINT16_MAX && lastSpace > start)
+      offset = static_cast<uint16_t>(lastSpace + 1);
+    if (offset < text.length() && text[offset] == '\n') ++offset;
+    while (offset < text.length() && text[offset] == ' ') ++offset;
+    ++lines;
+  }
+  return lines;
+}
+
+std::array<Rect, 3> hostRowRects(lgfx::LGFX_Sprite& sprite, const protocol::HostPage& page) {
+  std::array<Rect, 3> rects{};
+  sprite.setFont(&fonts::efontJA_12);
+  sprite.setTextWrap(false);
+  sprite.setTextSize(1.0f);
+  const int16_t lineHeight = static_cast<int16_t>(sprite.fontHeight()) + 1;
+  int16_t top = 50;
+  for (uint8_t i = 0; i < 3; ++i) {
+    if (!page.lines[i].length()) continue;
+    const uint16_t lineCount = std::max<uint16_t>(1, countWrappedLines(sprite, page.lines[i], 624));
+    const uint16_t shownLines = min<uint16_t>(lineCount, 2);
+    const int16_t rowHeight = static_cast<int16_t>(shownLines * lineHeight + 2);
+    rects[i] = {8, top, 624, rowHeight};
+    top = static_cast<int16_t>(top + rowHeight);
+  }
+  return rects;
+}
+
+struct MessageParts {
+  String sender;
+  String time;
+  String preview;
+  uint8_t markerLength = 4;
+};
+
+MessageParts messageParts(const String& line) {
+  const std::string_view text = textView(line);
+  MessageParts parts;
+  constexpr struct { const char* marker; const char* label; uint8_t length; } roles[] = {
+      {" a: ", "ASSISTANT", 4}, {" u: ", "USER", 4}, {" j: ", "JOB", 4},
+      {" l: ", "LOOM", 4}, {" L: ", "LOOM", 4}, {" w: ", "WORKER", 4},
+      {" k: ", "WORKER", 4}, {" n: ", "NOTICE", 4}, {" !: ", "NOTICE", 4},
+      {" *: ", "ASSISTANT", 4}, {" >", "WORKER", 2}};
+  size_t marker = std::string_view::npos;
+  for (const auto& role : roles) {
+    marker = text.find(role.marker);
+    if (marker != std::string_view::npos) {
+      parts.sender = role.label;
+      parts.markerLength = role.length;
+      break;
+    }
+  }
+  if (marker == std::string_view::npos) {
+    parts.sender = "MESSAGE";
+    parts.preview = line;
+    return parts;
+  }
+  parts.time = line.substring(0, static_cast<uint16_t>(marker));
+  size_t bodyStart = marker + parts.markerLength;
+  if (parts.markerLength == 2) {
+    const size_t separator = text.find(": ", bodyStart);
+    if (separator != std::string_view::npos) bodyStart = separator + 2;
+  }
+  parts.preview = line.substring(static_cast<uint16_t>(bodyStart));
+  return parts;
+}
+}
+
+FamiliarUi::FamiliarUi(lgfx::LGFX_Sprite& sprite, protocol::UiState& state,
+                       Emit emit, void* emitContext)
+    : sprite_(sprite), state_(state), emit_(emit), emitContext_(emitContext) {}
+
+void FamiliarUi::setFacePainter(FacePainter painter, void* context) {
+  facePainter_ = painter;
+  faceContext_ = context;
+}
+
+Rect FamiliarUi::tabRect(uint8_t index) {
+  constexpr uint8_t kTabCount = static_cast<uint8_t>(protocol::Page::Count);
+  if (index >= kTabCount) return {0, 0, 0, 0};
+  const int16_t left = (int32_t)index * kWidth / kTabCount;
+  const int16_t right = (int32_t)(index + 1) * kWidth / kTabCount;
+  return {left, 0, static_cast<int16_t>(right - left), kTabHeight};
+}
+
+Rect FamiliarUi::deckRect(uint8_t index) {
+  if (index >= 6) return {0, 0, 0, 0};
+  constexpr int16_t margin = 8, gapX = 8, top = 52, gapY = 8, height = 52;
+  const int16_t usable = kWidth - 2 * margin - 2 * gapX;
+  const int16_t left = margin + (index % 3) * (usable / 3 + gapX);
+  const int16_t right = index % 3 == 2 ? kWidth - margin : left + usable / 3;
+  return {left, static_cast<int16_t>(top + (index / 3) * (height + gapY)),
+          static_cast<int16_t>(right - left), height};
+}
+
+Rect FamiliarUi::allowRect() { return {8, kApprovalTop, 304, kApprovalHeight}; }
+Rect FamiliarUi::denyRect() { return {328, kApprovalTop, 304, kApprovalHeight}; }
+Rect FamiliarUi::approvalTextRect() { return {8, 45, 624, 74}; }
+Rect FamiliarUi::artRect() { return {0, kTabHeight, 144, 144}; }
+Rect FamiliarUi::messageCardRect(uint8_t index) {
+  if (index >= 2) return {0, 0, 0, 0};
+  return {8, static_cast<int16_t>(49 + index * 58), 624, 55};
+}
+Rect FamiliarUi::settingsThemeRect(uint8_t index) {
+  if (index >= themes::count()) return {0, 0, 0, 0};
+  constexpr int16_t margin = 8, gap = 8;
+  const int16_t count = static_cast<int16_t>(themes::count());
+  const int16_t width = static_cast<int16_t>(
+      (kWidth - 2 * margin - (count - 1) * gap) / count);
+  return {static_cast<int16_t>(margin + index * (width + gap)), 45, width, 37};
+}
+Rect FamiliarUi::settingsSoundRect() { return {8, 91, 304, 34}; }
+Rect FamiliarUi::settingsAnimationRect() { return {328, 91, 304, 34}; }
+Rect FamiliarUi::settingsBrightnessRect(uint8_t index) {
+  if (index >= 4) return {0, 0, 0, 0};
+  constexpr int16_t start = 130, width = 122, gap = 4;
+  return {static_cast<int16_t>(start + index * (width + gap)), 136, width, 28};
+}
+
+void FamiliarUi::emit(const String& json) {
+  if (emit_) emit_(emitContext_, json);
+}
+
+void FamiliarUi::tick(uint32_t nowMs) {
+  nowMs_ = nowMs;
+  if (state_.toastUntilMs && static_cast<int32_t>(nowMs - state_.toastUntilMs) >= 0) {
+    state_.toastUntilMs = 0;
+    state_.toast = "";
+    state_.dirty = true;
+  }
+  if (state_.armedDeck >= 0 && static_cast<int32_t>(nowMs - state_.armedUntilMs) >= 0) {
+    state_.armedDeck = -1;
+    state_.dirty = true;
+  }
+  if (state_.messageDetailPending &&
+      static_cast<uint32_t>(nowMs - messageDetailRequestedAtMs_) >= 8000) {
+    state_.messageDetailPending = false;
+    state_.messageDetailRequestedId = "";
+    state_.messageDetailError = "timeout";
+    state_.dirty = true;
+  }
+  if (messageDetailModal_ && state_.modalActive && state_.messageDetailHasMore &&
+      !state_.messageDetailPending && !state_.messageDetailError.length()) {
+    requestMessageDetail(state_.messageDetailNextOffset);
+  }
+}
+
+void FamiliarUi::render(uint32_t nowMs) {
+  tick(nowMs);
+  const themes::Palette& palette = themes::get(state_.themeId);
+  kBg = palette.background;
+  kPanel = palette.panel;
+  kDim = palette.secondary;
+  kGreen = palette.accent;
+  kInk = palette.text;
+  kAmber = palette.warning;
+  kRed = palette.danger;
+  kCyan = palette.code;
+  // Face painters and the reusable sprite can leave global text state behind.
+  // Set a known UTF-8 font and disable implicit edge wrapping every frame.
+  sprite_.setFont(&fonts::efontJA_12);
+  sprite_.setTextWrap(false);
+  sprite_.setTextSize(1.0f);
+  sprite_.fillScreen(kBg);
+  const bool live = state_.connected && nowMs - state_.lastSeenMs < 30000;
+  const uint16_t accent = state_.waiting ? (((nowMs / 400) & 1) ? kRed : kAmber)
+                         : state_.running ? kAmber : live ? kGreen : kDim;
+  drawTabs(accent);
+  if (state_.modalActive) drawModal();
+  else drawPage();
+  if (!state_.modalActive && state_.toastUntilMs && !state_.approval.active) {
+    sprite_.fillRoundRect(410, 26, 222, 20, 4, kPanel);
+    drawText(state_.toast, 416, 30, 210, kAmber, 1.0f, true, kPanel);
+  }
+  if (!state_.modalActive && state_.runningDeck >= 0 &&
+      state_.page != protocol::Page::Operations && state_.waiting == 0) {
+    sprite_.fillRoundRect(504, 26, 128, 20, 4, kPanel);
+    sprite_.drawRoundRect(504, 26, 128, 20, 4, kAmber);
+    drawText("WORKING", 514, 30, 112, kAmber, 1.0f, true, kPanel);
+  }
+  state_.dirty = false;
+}
+
+void FamiliarUi::drawTabs(uint16_t accent) {
+  for (uint8_t i = 0; i < static_cast<uint8_t>(protocol::Page::Count); ++i) {
+    const Rect r = tabRect(i);
+    const bool selected = pageIndex(state_.page) == i;
+    sprite_.fillRect(r.x, r.y, r.w, r.h, selected ? kPanel : kBg);
+    sprite_.drawFastHLine(r.x + 2, kTabHeight - 2, r.w - 4,
+                          selected ? accent : kDim);
+    drawCenteredText(kTabs[i], {r.x, 2, r.w, 17}, selected ? kInk : kDim,
+                     1.0f, selected ? kPanel : kBg);
+  }
+}
+
+void FamiliarUi::drawPage() {
+  switch (state_.page) {
+    case protocol::Page::Face: drawFace(); break;
+    case protocol::Page::Messages: drawMessages(); break;
+    case protocol::Page::Operations: drawOperations(); break;
+    case protocol::Page::Fleet: drawHostPage(state_.hostPages[2], "FLEET"); break;
+    case protocol::Page::Cron: drawHostPage(state_.hostPages[0], "CRON JOBS"); break;
+    case protocol::Page::Network: drawHostPage(state_.hostPages[1], "GATEWAY"); break;
+    case protocol::Page::Device: {
+      drawText("DEVICE STATUS", kContentX, 27, kContentRight - kContentX, kInk, 1.2f);
+      sprite_.drawFastHLine(kContentX, 46, kContentRight - kContentX, kDim);
+      const String rows[] = {
+        state_.sdStatus + "   " + state_.touchStatus,
+        state_.batteryStatus + "   " + state_.rtcStatus,
+        state_.wifiStatus + "   " + state_.networkStatus + "  " + state_.linkStatus,
+        state_.audioStatus,
+        state_.motionStatus,
+        "heap:" + String(state_.freeHeap) + "  rotation:" + String(state_.rotation)
+      };
+      for (uint8_t i = 0; i < 6; ++i) {
+        drawText(rows[i], kContentX, 49 + i * 19, kContentRight - 2 * kContentX,
+                 i == 2 && !state_.wifiConnected ? kAmber : kGreen, 1.0f);
+      }
+      break;
+    }
+    case protocol::Page::Settings: drawSettings(); break;
+    default: break;
+  }
+}
+
+void FamiliarUi::drawFace() {
+  const bool live = state_.connected && nowMs_ - state_.lastSeenMs < 30000;
+  const String group = !live ? "sleep" : state_.waiting ? "waiting" : state_.running ? "thinking" : "idle";
+  const Rect art = artRect();
+  if (facePainter_) facePainter_(sprite_, group, art, nowMs_, faceContext_);
+  else {
+    sprite_.drawRoundRect(art.x + 30, art.y + 40, 84, 64, 14, kGreen);
+    sprite_.drawCircle(art.x + 72, art.y + 72, 42, kDim);
+    sprite_.setTextSize(2); sprite_.setTextColor(kGreen, kBg);
+    sprite_.setCursor(art.x + 64, art.y + 63); sprite_.print("H");
+  }
+  sprite_.drawFastVLine(152, 30, 132, kDim);
+  drawText(state_.waiting ? "WAITING" : state_.running ? "WORKING" : live ? "ONLINE" : "IDLE",
+           164, 29, 338, state_.waiting ? kRed : state_.running ? kAmber : live ? kGreen : kDim,
+           1.2f);
+  char counts[48];
+  snprintf(counts, sizeof(counts), "SESS %d   RUN %d   WAIT %d",
+           state_.total, state_.running, state_.waiting);
+  drawText(counts, 164, 47, 468, kInk, 1.0f, false);
+  drawText("JOB", 164, 64, 36, kDim, 1.0f, false);
+  drawText(state_.jobLabel, 200, 64, 432, kGreen, 1.0f);
+  drawText("TOKENS", 164, 81, 55, kDim, 1.0f, false);
+  drawText(String(state_.tokensToday), 222, 81, 180, kInk, 1.0f);
+  sprite_.drawFastHLine(164, 94, 468, kDim);
+  drawText("LATEST", 164, 98, 468, kDim, 1.0f, false);
+  auto& preview = facePreviewCache_;
+  if (ensureMarkdownParsed(state_.message, preview.document, preview.hash, preview.ready)) {
+    uint16_t scroll = 0;
+    drawMarkdownRegion(sprite_, preview.document, {164, 113, 468, 52}, 1.0f,
+                       scroll, {kBg, kPanel, kGreen, kAmber, kCyan});
+  } else {
+    drawWrapped(plainText(state_.message), 164, 113, 468, 52, kGreen);
+  }
+  drawText(live ? state_.linkStatus : "OFFLINE", 510, 31, 122, live ? kGreen : kDim, 1.0f);
+}
+
+void FamiliarUi::drawMessages() {
+  const bool history = state_.historyOffset > 0 && state_.historyCount > 0;
+  const uint8_t count = history ? state_.historyCount : state_.entryCount;
+  if (pendingHistorySelection_ && state_.historyOffset == pendingHistoryOffset_) {
+    messageSelection_ = pendingMessageSelection_;
+    pendingHistorySelection_ = false;
+    messageSelectionId_ = count && messageSelection_ < count
+        ? (history ? state_.historyIds[messageSelection_] : state_.entryIds[messageSelection_])
+        : String("");
+  } else if (messageSelectionId_.length()) {
+    const String* ids = history ? state_.historyIds : state_.entryIds;
+    bool found = false;
+    for (uint8_t i = 0; i < count; ++i) {
+      if (ids[i] == messageSelectionId_) {
+        messageSelection_ = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) messageSelectionId_ = "";
+  }
+  if (count && messageSelection_ >= count) messageSelection_ = count - 1;
+  if (count && !messageSelectionId_.length()) {
+    const String* ids = history ? state_.historyIds : state_.entryIds;
+    messageSelectionId_ = ids[messageSelection_];
+  }
+  char heading[80];
+  if (history) {
+    snprintf(heading, sizeof(heading), "HISTORY %u-%u / %u  swipe up/down",
+             state_.historyOffset + 1, state_.historyOffset + state_.historyCount,
+             state_.historyTotal);
+  } else snprintf(heading, sizeof(heading), "MESSAGES  swipe up/down to browse");
+  drawText(heading, kContentX, 28, kContentRight - 2 * kContentX, kInk, 1.0f);
+  for (uint8_t card = 0; card < 2; ++card) {
+    const Rect r = messageCardRect(card);
+    const uint8_t index = static_cast<uint8_t>(messageSelection_ + card);
+    if (index >= count) continue;
+    const String& line = history ? state_.history[index] : state_.entries[index];
+    const MessageParts parts = messageParts(line);
+    const bool selected = card == 0;
+    sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 5, selected ? kGreen : kPanel);
+    drawText(parts.sender + (parts.time.length() ? "  " + parts.time : ""),
+             r.x + 8, r.y + 4, r.w - 104, kDim, 1.0f, false);
+    drawText("OPEN >", r.x + r.w - 72, r.y + 4, 62, selected ? kGreen : kDim,
+             1.0f, false);
+    auto& preview = messagePreviewCaches_[card];
+    if (ensureMarkdownParsed(parts.preview, preview.document, preview.hash, preview.ready)) {
+      uint16_t scroll = 0;
+      drawMarkdownRegion(sprite_, preview.document,
+                         {static_cast<int16_t>(r.x + 8), static_cast<int16_t>(r.y + 19),
+                          static_cast<int16_t>(r.w - 16), static_cast<int16_t>(r.h - 20)},
+                         1.0f, scroll, {kBg, kPanel, selected ? kInk : kGreen, kAmber, kCyan});
+    } else {
+      drawWrapped(plainText(parts.preview), r.x + 8, r.y + 19, r.w - 16, r.h - 20,
+                  selected ? kInk : kGreen, 1.0f);
+    }
+  }
+  if (!count) {
+    drawText("no messages yet", kContentX, 68, kContentRight - 2 * kContentX, kDim);
+  }
+}
+
+void FamiliarUi::drawOperations() {
+  if (state_.approval.active || state_.waiting > 0) {
+    drawText("APPROVAL REQUIRED - tap request for full text", 8, 27, 624, kRed, 1.0f);
+    const Rect detail = approvalTextRect();
+    sprite_.drawRoundRect(detail.x, detail.y, detail.w, detail.h, 4, kDim);
+    drawWrapped(state_.approval.active ? state_.approval.text : state_.message,
+                detail.x + 8, detail.y + 6, detail.w - 16, detail.h - 12, kInk);
+    const Rect allow = allowRect(), deny = denyRect();
+    sprite_.drawRoundRect(allow.x, allow.y, allow.w, allow.h, 5, kGreen);
+    sprite_.drawRoundRect(deny.x, deny.y, deny.w, deny.h, 5, kRed);
+    drawCenteredText("ALLOW", allow, kGreen, 1.2f);
+    drawCenteredText("DENY", deny, kRed, 1.2f);
+    return;
+  }
+  drawText("THE DECK", 8, 27, 76, kInk, 1.2f, false);
+  drawText(state_.jobState + ": " + state_.jobLabel, 90, 29, 542, kDim, 1.0f);
+  if (!state_.deckCount) {
+    drawText("no buttons from host yet", 8, 62, 624, kDim);
+    return;
+  }
+  for (uint8_t i = 0; i < state_.deckCount; ++i) {
+    const Rect r = deckRect(i);
+    const uint16_t deckColors[] = {kGreen, kAmber, kRed, kCyan};
+    const uint16_t color = deckColors[state_.deck[i].color & 3];
+    const bool running = state_.runningDeck == i;
+    const bool armed = state_.armedDeck == i && static_cast<int32_t>(nowMs_ - state_.armedUntilMs) < 0;
+    if (running) sprite_.fillRoundRect(r.x, r.y, r.w, r.h, 5, color);
+    else sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 5, armed ? kAmber : color);
+    const String label = armed ? "SURE?" : state_.deck[i].label;
+    drawText(label, r.x + 8, r.y + 8, r.w - 16,
+             running ? kBg : armed ? kAmber : color, 1.0f, true, running ? color : kBg);
+    drawCenteredText(running ? "STOP" : state_.deck[i].confirm && !armed ? "2TAP" : "",
+                     {static_cast<int16_t>(r.x + r.w - 52), static_cast<int16_t>(r.y + 31), 44, 16},
+                     running ? kBg : kDim, 0.85f, running ? color : kBg);
+  }
+}
+
+void FamiliarUi::drawSettings() {
+  drawText("SETTINGS", kContentX, 27, kContentRight - kContentX, kInk, 1.2f, false);
+  for (uint8_t i = 0; i < themes::count(); ++i) {
+    const Rect r = settingsThemeRect(i);
+    const bool selected = state_.themeId == i;
+    const themes::Palette& colors = themes::get(i);
+    sprite_.fillRoundRect(r.x, r.y, r.w, r.h, 4, colors.background);
+    sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 4, selected ? colors.accent : colors.secondary);
+    drawCenteredText(colors.name, {r.x, static_cast<int16_t>(r.y + 2), r.w, 17},
+                     colors.text, 1.0f, colors.background);
+    drawCenteredText(selected ? "ACTIVE" : "PREVIEW",
+                     {r.x, static_cast<int16_t>(r.y + 18), r.w, 14},
+                     colors.text,
+                     1.0f, colors.background);
+  }
+
+  const Rect sound = settingsSoundRect(), animation = settingsAnimationRect();
+  const uint16_t soundColor = state_.soundMuted ? kAmber : kGreen;
+  const uint16_t animationColor = state_.animationEnabled ? kGreen : kAmber;
+  sprite_.drawRoundRect(sound.x, sound.y, sound.w, sound.h, 4, soundColor);
+  sprite_.drawRoundRect(animation.x, animation.y, animation.w, animation.h, 4, animationColor);
+  drawCenteredText(state_.soundMuted ? "SOUND  MUTED" : "SOUND  ON", sound, kInk, 1.0f);
+  drawCenteredText(state_.animationEnabled ? "ANIMATION  ON" : "ANIMATION  PAUSED",
+                   animation, kInk, 1.0f);
+
+  drawText("BRIGHTNESS", 8, 143, 114, kDim, 1.0f, false);
+  constexpr uint8_t levels[] = {25, 50, 75, 100};
+  for (uint8_t i = 0; i < 4; ++i) {
+    const Rect r = settingsBrightnessRect(i);
+    const bool selected = state_.brightnessPercent == levels[i];
+    sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 4, selected ? kGreen : kDim);
+    drawCenteredText(String(levels[i]) + "%", r, kInk, 1.0f);
+  }
+}
+
+void FamiliarUi::drawHostPage(const protocol::HostPage& page, const char* fallback) {
+  drawText(page.set ? page.title : String(fallback), 8, 27, 624, kInk, 1.2f);
+  sprite_.drawFastHLine(8, 46, 624, kDim);
+  if (!page.set) {
+    drawText("no data from host yet", 8, 57, 624, kDim, 1.0f);
+    return;
+  }
+  const auto rows = hostRowRects(sprite_, page);
+  for (uint8_t i = 0; i < 3; ++i) {
+    if (rows[i].h == 0) continue;
+    sprite_.setTextColor(kGreen, kBg);
+    drawWrapped(page.lines[i], rows[i].x, rows[i].y, rows[i].w, rows[i].h - 2, kGreen);
+  }
+  drawText("tap a line to read full text", 8, 159, 624, kDim, 1.0f, false);
+}
+
+void FamiliarUi::drawModal() {
+  drawText(agentResponseModal_ ? "LATEST RESPONSE" : state_.modal.title,
+           8, 27, 624, kInk, 1.2f);
+  sprite_.drawFastHLine(8, 46, 624, kDim);
+  if (modalContent().length()) {
+    if (agentResponseModal_ || messageDetailModal_) drawMarkdownResponse();
+    else drawWrapped(modalContent(), 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
+    const char* footer = agentResponseModal_ &&
+            (agentResponseModalTruncated_ || responseDocument_.truncated)
+        ? "response shortened - swipe up/down, tap to return"
+        : messageDetailModal_ && state_.messageDetailPending
+            ? (state_.messageDetailBody.length()
+                   ? "loading more message - swipe up/down, tap to return"
+                   : "loading full message - swipe up/down, tap to return")
+        : messageDetailModal_ && state_.messageDetailError.length()
+            ? (state_.messageDetailError == "preview-only"
+                   ? "preview only - full text unavailable"
+                   : state_.messageDetailBody.length()
+                       ? "message incomplete - showing partial text"
+                       : "full text unavailable - showing preview")
+        : messageDetailModal_ && state_.messageDetailTruncated
+            ? "available text shortened - swipe up/down, tap to return"
+        : messageDetailModal_ && messageDetailSimplified_
+            ? "simplified formatting - swipe up/down, tap to return"
+        : !messageDetailModal_ && (agentResponseModalTruncated_ || responseDocument_.truncated)
+            ? "response shortened - swipe up/down, tap to return"
+            : "swipe up/down to read - tap to return";
+    drawText(footer,
+             8, 159, 624, kDim, 1.0f, false);
+  } else {
+    sprite_.setFont(&fonts::efontJA_12);
+    sprite_.setTextWrap(false);
+    sprite_.setTextSize(1.0f);
+    const int16_t lineHeight = static_cast<int16_t>(sprite_.fontHeight()) + 1;
+    constexpr int16_t contentBottom = 152;
+    int16_t top = 50;
+    for (uint8_t i = 0; i < 3; ++i) {
+      if (!state_.modal.lines[i].length()) continue;
+      const uint16_t lines = std::max<uint16_t>(
+          1, countWrappedLines(sprite_, state_.modal.lines[i], 624));
+      uint8_t laterRows = 0;
+      for (uint8_t next = i + 1; next < 3; ++next)
+        if (state_.modal.lines[next].length()) ++laterRows;
+      const int16_t reserved = static_cast<int16_t>(laterRows * (lineHeight + 2));
+      const int16_t lineSlots = static_cast<int16_t>(
+          (contentBottom - top - reserved) / lineHeight);
+      if (lineSlots <= 0) break;
+      const uint16_t shownLines = std::min<uint16_t>(lines, lineSlots);
+      const int16_t height = static_cast<int16_t>(shownLines * lineHeight);
+      drawWrapped(state_.modal.lines[i], 8, top, 624, height, kGreen);
+      top = static_cast<int16_t>(top + height + 2);
+    }
+    drawText("tap to return", 8, 159, 624, kDim, 1.0f, false);
+  }
+}
+
+void FamiliarUi::ensureResponseParsed() {
+  const String& source = modalContent();
+  uint32_t hash = 2166136261u;
+  for (uint16_t i = 0; i < source.length(); ++i) {
+    hash ^= static_cast<uint8_t>(source[i]);
+    hash *= 16777619u;
+  }
+  hash ^= source.length();
+  if (responseParseReady_ && hash == parsedResponseHash_) return;
+  responseDocument_.clear();
+  responseParseReady_ = markdown::parsePrefix(textView(source), responseDocument_);
+  messageDetailSimplified_ = messageDetailModal_ &&
+      (responseDocument_.truncated || !responseParseReady_) &&
+      source.length() <= markdown::kMaxSourceBytes;
+  parsedResponseHash_ = hash;
+}
+
+void FamiliarUi::drawMarkdownResponse() {
+  ensureResponseParsed();
+  if (!responseParseReady_) {
+    drawWrapped(modalContent(), 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
+    return;
+  }
+  if (messageDetailModal_ && messageDetailSimplified_) {
+    drawWrapped(modalContent(), 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
+    return;
+  }
+  drawMarkdownRegion(sprite_, responseDocument_, {8, 51, 624, 101}, 1.0f,
+                     modalScroll_, {kBg, kPanel, kGreen, kAmber, kCyan});
+}
+
+void FamiliarUi::drawText(const String& source, int16_t x, int16_t y, int16_t width,
+                          uint16_t color, float size, bool ellipsis, uint32_t background) {
+  if (width <= 0) return;
+  const String text = plainText(source);
+  sprite_.setFont(&fonts::efontJA_12);
+  sprite_.setTextWrap(false);
+  sprite_.setTextSize(size);
+  String fitted;
+  const String suffix = "...";
+  uint16_t firstLineEnd = 0;
+  while (firstLineEnd < text.length() && text[firstLineEnd] != '\n') ++firstLineEnd;
+  const String firstLine = text.substring(0, firstLineEnd);
+  const bool hasRemainder = firstLineEnd < text.length();
+  if (!hasRemainder && emoji_text::measure(sprite_, textView(firstLine), size) <= width) {
+    fitted = firstLine;
+  } else {
+    const bool useSuffix = ellipsis && emoji_text::measure(sprite_, textView(suffix), size) <= width;
+    uint16_t offset = 0;
+    while (offset < firstLine.length()) {
+      size_t tokenOffset = offset;
+      emoji_text::Token token;
+      if (!emoji_text::nextToken(textView(firstLine), tokenOffset, token)) break;
+      const uint16_t next = static_cast<uint16_t>(token.end);
+      const String glyph = firstLine.substring(offset, next);
+      const String candidate = fitted + glyph;
+      const String visible = useSuffix ? candidate + suffix : candidate;
+      if (emoji_text::measure(sprite_, textView(visible), size) > width) break;
+      fitted = candidate;
+      offset = next;
+    }
+    if (useSuffix) fitted += suffix;
+  }
+  const uint16_t resolvedBackground = background == UINT32_MAX
+      ? kBg : static_cast<uint16_t>(background);
+  emoji_text::draw(sprite_, textView(fitted), x, y, color, resolvedBackground, size);
+}
+
+void FamiliarUi::drawCenteredText(const String& source, const Rect& rect,
+                                  uint16_t color, float size, uint32_t background) {
+  const String text = plainText(source);
+  sprite_.setFont(&fonts::efontJA_12);
+  sprite_.setTextWrap(false);
+  sprite_.setTextSize(size);
+  const int16_t textWidth = emoji_text::measure(sprite_, textView(text), size);
+  const int16_t textHeight = static_cast<int16_t>(sprite_.fontHeight());
+  const int16_t x = static_cast<int16_t>(rect.x + (rect.w - min<int16_t>(rect.w, textWidth)) / 2);
+  const int16_t y = static_cast<int16_t>(rect.y + (rect.h - textHeight) / 2);
+  drawText(text, x, y, rect.w, color, size, true, background);
+}
+
+void FamiliarUi::drawWrapped(const String& source, int16_t x, int16_t y, int16_t width,
+                             int16_t height, uint16_t color, float scale,
+                             uint16_t skipLines) {
+  if (width <= 0 || height <= 0) return;
+  const String text = plainText(source);
+  sprite_.setFont(&fonts::efontJA_12);
+  sprite_.setTextWrap(false);
+  sprite_.setTextSize(scale);
+  const int16_t lineHeight = static_cast<int16_t>(sprite_.fontHeight()) + 1;
+  const int16_t maxLines = std::max<int16_t>(1, height / std::max<int16_t>(1, lineHeight));
+  constexpr uint8_t kStoredLines = 16;
+  std::array<String, kStoredLines> visible{};
+  uint16_t totalLines = 0;
+  uint16_t offset = 0;
+  while (offset < text.length()) {
+    if (text[offset] == '\n') {
+      if (totalLines >= skipLines && totalLines < skipLines + maxLines &&
+          totalLines - skipLines < kStoredLines)
+        visible[totalLines - skipLines] = "";
+      ++totalLines;
+      ++offset;
+      continue;
+    }
+    while (offset < text.length() && text[offset] == ' ') ++offset;
+    if (offset >= text.length()) break;
+
+    const uint16_t start = offset;
+    uint16_t fitEnd = start;
+    uint16_t lastSpace = UINT16_MAX;
+    uint16_t scan = start;
+    while (scan < text.length() && text[scan] != '\n') {
+      size_t tokenOffset = scan;
+      emoji_text::Token token;
+      if (!emoji_text::nextToken(textView(text), tokenOffset, token)) break;
+      const uint16_t next = static_cast<uint16_t>(token.end);
+      const String glyph = text.substring(scan, next);
+      if (emoji_text::measure(sprite_, textView(text).substr(start, next - start), scale) > width) break;
+      if (glyph == " ") lastSpace = scan;
+      fitEnd = next;
+      scan = next;
+    }
+    if (fitEnd == start) {
+      size_t tokenOffset = start;
+      emoji_text::Token token;
+      if (emoji_text::nextToken(textView(text), tokenOffset, token))
+        fitEnd = static_cast<uint16_t>(token.end);
+    }
+    uint16_t lineEnd = fitEnd;
+    uint16_t nextOffset = fitEnd;
+    if (scan < text.length() && text[scan] != '\n' && lastSpace != UINT16_MAX && lastSpace > start) {
+      lineEnd = lastSpace;
+      nextOffset = static_cast<uint16_t>(lastSpace + 1);
+    }
+    String line = text.substring(start, lineEnd);
+    if (totalLines >= skipLines && totalLines < skipLines + maxLines &&
+        totalLines - skipLines < kStoredLines)
+      visible[totalLines - skipLines] = line;
+    ++totalLines;
+    offset = nextOffset;
+    if (offset < text.length() && text[offset] == '\n') ++offset;
+    while (offset < text.length() && text[offset] == ' ') ++offset;
+  }
+
+  const uint16_t visibleLines = min<uint16_t>(maxLines, kStoredLines);
+  const bool moreBelow = totalLines > skipLines + visibleLines;
+  for (uint16_t i = 0; i < visibleLines && skipLines + i < totalLines; ++i) {
+    String line = visible[i];
+    const bool finalVisible = moreBelow && i + 1 == visibleLines;
+    if (finalVisible) drawText(line + "...", x, y + i * lineHeight, width, color, scale, true);
+    else drawText(line, x, y + i * lineHeight, width, color, scale, false);
+  }
+}
+
+void FamiliarUi::selectPage(uint8_t index) {
+  if (index >= static_cast<uint8_t>(protocol::Page::Count)) return;
+  state_.page = static_cast<protocol::Page>(index);
+  state_.modalActive = false;
+  state_.modalBody = "";
+  state_.toastUntilMs = 0;
+  state_.historyOffset = 0;
+  messageSelection_ = 0;
+  messageSelectionId_ = "";
+  pendingHistorySelection_ = false;
+  state_.dirty = true;
+}
+
+void FamiliarUi::decideApproval(const char* decision) {
+  if (!state_.connected || nowMs_ - state_.lastSeenMs >= 30000 ||
+      !state_.approval.active || !state_.approval.id.length()) {
+    state_.message = "Awaiting a current approval request from Hermes";
+    state_.dirty = true;
+    return;
+  }
+  JsonDocument document;
+  document["cmd"] = "permission";
+  document["decision"] = decision;
+  document["id"] = state_.approval.id;
+  String line;
+  serializeJson(document, line);
+  emit(line);
+  state_.approval.active = false;
+  state_.waiting = 0;
+  state_.message = String("decision: ") + decision;
+  state_.dirty = true;
+}
+
+const String& FamiliarUi::modalContent() const {
+  if (messageDetailModal_ && state_.messageDetailBody.length()) return state_.messageDetailBody;
+  return state_.modalBody;
+}
+
+void FamiliarUi::requestMessageDetail(uint32_t offset) {
+  if (!messageDetailModal_ || !state_.modalActive ||
+      state_.messageDetailRequestedId.isEmpty()) return;
+  JsonDocument document;
+  document["cmd"] = "msg";
+  document["id"] = state_.messageDetailRequestedId;
+  document["offset"] = offset;
+  String request;
+  serializeJson(document, request);
+  state_.messageDetailRequestedOffset = offset;
+  state_.messageDetailPending = true;
+  messageDetailRequestedAtMs_ = nowMs_;
+  emit(request);
+}
+
+void FamiliarUi::openAgentResponseModal() {
+  state_.modalReturn = state_.page;
+  state_.modalActive = true;
+  agentResponseModal_ = true;
+  messageDetailModal_ = false;
+  state_.modalBody = state_.agentResponseMarkdown;
+  agentResponseModalTruncated_ = state_.agentResponseMarkdownTruncated;
+  responseParseReady_ = false;
+  modalScroll_ = 0;
+}
+
+void FamiliarUi::openMessage(uint8_t index, bool history) {
+  const uint8_t count = history ? state_.historyCount : state_.entryCount;
+  if (index >= count) return;
+  const String& line = history ? state_.history[index] : state_.entries[index];
+  const String& id = history ? state_.historyIds[index] : state_.entryIds[index];
+  const MessageParts parts = messageParts(line);
+
+  state_.modalReturn = state_.page;
+  state_.modal.title = parts.sender + " MESSAGE";
+  state_.modalBody = parts.preview;
+  state_.modalActive = true;
+  agentResponseModal_ = false;
+  agentResponseModalTruncated_ = false;
+  messageDetailModal_ = true;
+  state_.messageDetailRequestedId = id;
+  state_.messageDetailPending = id.length() > 0;
+  state_.messageDetailBody = "";
+  state_.messageDetailRole = parts.sender;
+  state_.messageDetailError = id.length() ? "" : "preview-only";
+  state_.messageDetailTruncated = false;
+  state_.messageDetailHasMore = false;
+  state_.messageDetailRequestedOffset = 0;
+  state_.messageDetailNextOffset = 0;
+  state_.messageDetailTotalBytes = 0;
+  messageDetailSimplified_ = false;
+  responseParseReady_ = false;
+  messageDetailRequestedAtMs_ = nowMs_;
+  modalScroll_ = 0;
+  if (id.length()) {
+    requestMessageDetail(0);
+  }
+}
+
+void FamiliarUi::browseMessages(bool older) {
+  const bool history = state_.historyOffset > 0 && state_.historyCount > 0;
+  const uint8_t count = history ? state_.historyCount : state_.entryCount;
+  if (!count) return;
+  if (older) {
+    if (messageSelection_ + 1 < count) {
+      ++messageSelection_;
+      const String* ids = history ? state_.historyIds : state_.entryIds;
+      messageSelectionId_ = ids[messageSelection_];
+      state_.dirty = true;
+      return;
+    }
+    if (!history || state_.historyOffset + count < state_.historyTotal) {
+      const uint16_t next = history ? state_.historyOffset + 5 : 5;
+      JsonDocument document;
+      document["cmd"] = "msgs";
+      document["off"] = next;
+      String request;
+      serializeJson(document, request);
+      emit(request);
+      pendingHistorySelection_ = true;
+      pendingHistoryOffset_ = next;
+      pendingMessageSelection_ = 0;
+    }
+    return;
+  }
+
+  if (messageSelection_ > 0) {
+    --messageSelection_;
+    const String* ids = history ? state_.historyIds : state_.entryIds;
+    messageSelectionId_ = ids[messageSelection_];
+    state_.dirty = true;
+    return;
+  }
+  if (!history) return;
+  if (state_.historyOffset <= 5) {
+    state_.historyOffset = 0;
+    messageSelection_ = state_.entryCount ? state_.entryCount - 1 : 0;
+    messageSelectionId_ = state_.entryCount ? state_.entryIds[messageSelection_] : String("");
+    pendingHistorySelection_ = false;
+    state_.dirty = true;
+    return;
+  }
+  const uint16_t next = state_.historyOffset - 5;
+  JsonDocument document;
+  document["cmd"] = "msgs";
+  document["off"] = next;
+  String request;
+  serializeJson(document, request);
+  emit(request);
+  pendingHistorySelection_ = true;
+  pendingHistoryOffset_ = next;
+  pendingMessageSelection_ = 4;
+}
+
+void FamiliarUi::handleTap(int16_t x, int16_t y) {
+  emit(String("{\"cmd\":\"touch\",\"x\":") + x + ",\"y\":" + y + "}");
+  if (state_.toastUntilMs) { state_.toastUntilMs = 0; state_.toast = ""; }
+  if (state_.modalActive) {
+    state_.messageDetailPending = false;
+    state_.messageDetailRequestedId = "";
+    state_.modalActive = false;
+    state_.modalBody = "";
+    agentResponseModal_ = false;
+    agentResponseModalTruncated_ = false;
+    messageDetailModal_ = false;
+    state_.page = state_.modalReturn;
+    state_.dirty = true;
+    return;
+  }
+  for (uint8_t i = 0; i < static_cast<uint8_t>(protocol::Page::Count); ++i)
+    if (tabRect(i).contains(x, y)) { selectPage(i); return; }
+  if (state_.page == protocol::Page::Settings) {
+    uint8_t chosenTheme = UINT8_MAX;
+    for (uint8_t i = 0; i < themes::count(); ++i)
+      if (settingsThemeRect(i).contains(x, y)) { chosenTheme = i; break; }
+    if (chosenTheme != UINT8_MAX && state_.themeId != chosenTheme) {
+      state_.themeId = chosenTheme;
+      state_.uiSettingsDirty = true;
+      state_.dirty = true;
+    } else if (settingsSoundRect().contains(x, y)) {
+      state_.soundMuted = !state_.soundMuted;
+      state_.uiSettingsDirty = true;
+      state_.dirty = true;
+    } else if (settingsAnimationRect().contains(x, y)) {
+      state_.animationEnabled = !state_.animationEnabled;
+      state_.uiSettingsDirty = true;
+      state_.dirty = true;
+    } else {
+      constexpr uint8_t levels[] = {25, 50, 75, 100};
+      for (uint8_t i = 0; i < 4; ++i) {
+        if (!settingsBrightnessRect(i).contains(x, y) || state_.brightnessPercent == levels[i]) continue;
+        state_.brightnessPercent = levels[i];
+        state_.uiSettingsDirty = true;
+        state_.dirty = true;
+        break;
+      }
+    }
+    return;
+  }
+  if (state_.page == protocol::Page::Operations) {
+    if (state_.approval.active || state_.waiting > 0) {
+      // Exact regions alone resolve an approval. Its text, title, border,
+      // surrounding whitespace and the gap between buttons never do.
+      if (allowRect().contains(x, y)) decideApproval("once");
+      else if (denyRect().contains(x, y)) decideApproval("deny");
+      else if (approvalTextRect().contains(x, y)) {
+        state_.modal.title = "APPROVAL DETAIL";
+        state_.modalBody = state_.approval.detail.length()
+                             ? state_.approval.text + "\n\n" + state_.approval.detail
+                             : state_.approval.text;
+        state_.modalReturn = protocol::Page::Operations;
+        state_.modalActive = true;
+        agentResponseModal_ = false;
+        agentResponseModalTruncated_ = false;
+        messageDetailModal_ = false;
+        modalScroll_ = 0;
+      }
+    } else {
+      for (uint8_t i = 0; i < state_.deckCount; ++i) if (deckRect(i).contains(x, y)) {
+        if (state_.deck[i].confirm && state_.runningDeck != i && state_.armedDeck != i) {
+          state_.armedDeck = i; state_.armedUntilMs = nowMs_ + 2500;
+          state_.message = state_.deck[i].label + ": tap again";
+        } else {
+          state_.armedDeck = -1;
+          emit(String("{\"cmd\":\"deck\",\"i\":") + i + "}");
+          state_.message = "deck: " + state_.deck[i].label;
+        }
+        state_.dirty = true;
+        return;
+      }
+    }
+  } else if (state_.page == protocol::Page::Face && x < artRect().x + artRect().w) {
+    state_.message = "face tapped";
+  } else if (state_.page == protocol::Page::Face) {
+    if (state_.agentResponseMarkdown.length() && x >= 164 && y >= 111)
+      openAgentResponseModal();
+    else emit("{\"cmd\":\"stats\"}");
+  } else if (state_.page == protocol::Page::Messages) {
+    const bool history = state_.historyOffset > 0 && state_.historyCount > 0;
+    const uint8_t count = history ? state_.historyCount : state_.entryCount;
+    for (uint8_t card = 0; card < 2; ++card) {
+      if (!messageCardRect(card).contains(x, y)) continue;
+      const uint8_t index = static_cast<uint8_t>(messageSelection_ + card);
+      if (index < count) openMessage(index, history);
+      break;
+    }
+  } else if (state_.page == protocol::Page::Fleet ||
+             state_.page == protocol::Page::Cron ||
+             state_.page == protocol::Page::Network) {
+    const protocol::HostPage* page = state_.page == protocol::Page::Fleet
+        ? &state_.hostPages[2]
+        : state_.page == protocol::Page::Cron ? &state_.hostPages[0]
+                                               : &state_.hostPages[1];
+    if (page->set) {
+      const auto rows = hostRowRects(sprite_, *page);
+      bool opened = false;
+      for (uint8_t row = 0; row < rows.size(); ++row) {
+        if (rows[row].contains(x, y)) {
+          state_.modal.title = page->title;
+          state_.modalBody = page->lines[row];
+          state_.modalReturn = state_.page;
+          state_.modalActive = true;
+          modalScroll_ = 0;
+          agentResponseModal_ = false;
+          agentResponseModalTruncated_ = false;
+          messageDetailModal_ = false;
+          opened = true;
+          break;
+        }
+      }
+      if (!opened && state_.page == protocol::Page::Network) emit("{\"cmd\":\"net\"}");
+    } else if (state_.page == protocol::Page::Network) {
+      emit("{\"cmd\":\"net\"}");
+    }
+  }
+  state_.dirty = true;
+}
+
+void FamiliarUi::touchGesture(int16_t sx, int16_t sy, int16_t ex, int16_t ey,
+                              uint32_t durationMs, uint32_t nowMs) {
+  tick(nowMs);
+  const int16_t dx = ex - sx, dy = ey - sy;
+  if (state_.modalActive && abs(dy) >= 36 && abs(dx) <= 55) {
+    if (modalContent().length()) {
+      modalScroll_ = dy < 0 ? modalScroll_ + 3 : modalScroll_ > 3 ? modalScroll_ - 3 : 0;
+      state_.dirty = true;
+    }
+    return;
+  }
+  if (state_.modalActive) {
+    state_.messageDetailPending = false;
+    state_.messageDetailRequestedId = "";
+    state_.modalActive = false;
+    state_.modalBody = "";
+    agentResponseModal_ = false;
+    agentResponseModalTruncated_ = false;
+    messageDetailModal_ = false;
+    state_.page = state_.modalReturn;
+    state_.dirty = true;
+    return;
+  }
+  const bool horizontal = abs(dx) >= 45 && abs(dy) <= 55;
+  const bool vertical = abs(dy) >= 45 && abs(dx) <= 55;
+  if (horizontal) {
+    const int pageCount = static_cast<int>(protocol::Page::Count);
+    int next = (static_cast<int>(state_.page) + (dx < 0 ? 1 : pageCount - 1)) % pageCount;
+    selectPage(next);
+    state_.message = dx < 0 ? "swipe: next" : "swipe: prev";
+    emit(String("{\"cmd\":\"swipe\",\"dx\":") + dx + ",\"dy\":" + dy + "}");
+    return;
+  }
+  if (vertical && !state_.modalActive && state_.page == protocol::Page::Messages) {
+    browseMessages(dy < 0);
+    return;
+  }
+  if (durationMs < 1200 && abs(dx) < 24 && abs(dy) < 24) handleTap(sx, sy);
+}
+
+}  // namespace ui
