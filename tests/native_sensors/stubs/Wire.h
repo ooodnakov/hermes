@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 class TwoWire {
@@ -25,7 +26,7 @@ class TwoWire {
   }
   uint8_t endTransmission(bool stop) {
     ++transactionCount;
-    if (failTransaction == transactionCount) return 4;
+    if (failTransaction == transactionCount || failTransactions.count(transactionCount)) return 4;
     if (tx_.empty()) return 0;
     pointer_[address_] = tx_[0];
     if (stop && tx_.size() > 1) {
@@ -59,6 +60,7 @@ class TwoWire {
   }
   int transactionCount = 0;
   int failTransaction = -1;
+  std::set<int> failTransactions;
   int requestCount = 0;
   int shortReadRequest = -1;
   int writeLimit_ = -1;

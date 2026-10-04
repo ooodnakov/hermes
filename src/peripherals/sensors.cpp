@@ -168,7 +168,8 @@ bool Sensors::setRtcDateTime(int year, int month, int day, int hour, int minute,
   const uint8_t stoppedControl = static_cast<uint8_t>((control | kRtcStopBit) & ~kRtc12HourBit);
   if (!writeRegister(kRtcAddress, kRtcControl1, stoppedControl)) {
     // Transaction outcome may be uncertain; restore the original control byte.
-    (void)writeRegister(kRtcAddress, kRtcControl1, control);
+    if (!writeRegister(kRtcAddress, kRtcControl1, control))
+      (void)writeRegister(kRtcAddress, kRtcControl1, control);
     state_.rtcTimeValid = false;
     incrementSaturated(state_.rtcErrors);
     return false;
@@ -269,10 +270,6 @@ void Sensors::sampleBattery() {
   // analogReadMilliVolts() uses the core's calibrated ADC conversion. The
   // divider is the vendor V1 3:1 ratio; no empirical correction or expander
   // P1 gate is applied until that path is confirmed against board evidence.
-  if (!batteryAdcReady_) {
-    state_.batterySampleReady = false;
-    return;
-  }
   if (!batteryAdcReady_) {
     state_.batterySampleReady = false;
     return;
@@ -482,15 +479,21 @@ void Sensors::detectGesture(uint32_t nowMs) {
 void Sensors::update(uint32_t nowMs) {
   if (bus_ == nullptr) return;
   if (nowMs - lastBatteryMs_ >= kBatteryIntervalMs) {
-    lastBatteryMs_ = nowMs;
+    // Keep the established cadence when the caller is a little late.  Reset
+    // the phase after a longer pause so subsequent update() calls cannot run a
+    // burst of stale work. Unsigned subtraction keeps this rollover-safe.
+    lastBatteryMs_ = nowMs - lastBatteryMs_ >= kBatteryIntervalMs * 2
+        ? nowMs : lastBatteryMs_ + kBatteryIntervalMs;
     sampleBattery();
   }
   if (nowMs - lastRtcMs_ >= kRtcIntervalMs) {
-    lastRtcMs_ = nowMs;
+    lastRtcMs_ = nowMs - lastRtcMs_ >= kRtcIntervalMs * 2
+        ? nowMs : lastRtcMs_ + kRtcIntervalMs;
     sampleRtc();
   }
   if (nowMs - lastImuMs_ >= kImuIntervalMs) {
-    lastImuMs_ = nowMs;
+    lastImuMs_ = nowMs - lastImuMs_ >= kImuIntervalMs * 2
+        ? nowMs : lastImuMs_ + kImuIntervalMs;
     sampleImu(nowMs);
   }
   // Recovery is limited to a WHO_AM_I probe and local sensor reconfiguration;
