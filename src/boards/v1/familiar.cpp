@@ -3,6 +3,7 @@
 #include "../../audio/v1_es8311.h"
 #include "../../display/axs15231b_display.h"
 #include "../../input/axs15231b_touch.h"
+#include "../../network/v1_ble.h"
 #include "../../network/v1_network.h"
 #include "../../network/transport_policy.h"
 #include "../../peripherals/sensors.h"
@@ -35,11 +36,16 @@ input::Axs15231bTouch touch(Wire);
 LGFX_Sprite canvas;
 protocol::UiState state;
 network::V1Network networkService;
+network::V1Ble bleService;
 uint32_t usbLastInputAt = 0;
 bool processingUsbLine = false;
+bool processingBleLine = false;
+bool approvalFromBle = false;
+uint32_t observedBleDisconnects = 0;
 ui::FamiliarUi familiarUi(canvas, state, [](void*, const String& line) {
   Serial.println(line);
   networkService.sendLine(line.c_str(), usbLastInputAt && millis() - usbLastInputAt < 30000);
+  bleService.sendLine(line.c_str());
 });
 storage::V1Assets assets;
 peripherals::Sensors sensors;
@@ -150,6 +156,7 @@ void sendJson(JsonDocument& document) {
   Serial.write(reinterpret_cast<const uint8_t*>(line), length);
   Serial.write('\n');
   networkService.sendLine(line, usbLastInputAt && millis() - usbLastInputAt < 30000);
+  bleService.sendLine(line);
 }
 
 void sendHello(const char* transport) {
@@ -264,7 +271,22 @@ void sendDiagnostic() {
   diagnostic["wifi_configured"] = networkService.wifiConfigured();
   diagnostic["wifi_ready"] = networkService.wifiReady();
   if (networkService.wifiReady()) diagnostic["wifi_ip"] = networkService.localIp().toString();
-  diagnostic["ble"] = "unsupported";
+  diagnostic["ble"] = bleService.status();
+  diagnostic["ble_ready"] = bleService.ready();
+  diagnostic["ble_connected"] = bleService.connected();
+  diagnostic["ble_authenticated"] = bleService.authenticated();
+  diagnostic["ble_subscribed"] = bleService.subscribed();
+  diagnostic["ble_mtu"] = bleService.mtu();
+  diagnostic["ble_connects"] = bleService.connects();
+  diagnostic["ble_disconnects"] = bleService.disconnects();
+  diagnostic["ble_auth_failures"] = bleService.authFailures();
+  diagnostic["ble_rejected_writes"] = bleService.rejectedWrites();
+  diagnostic["ble_framing_errors"] = bleService.framingErrors();
+  diagnostic["ble_notify_failures"] = bleService.notifyFailures();
+  diagnostic["ble_input_high_water"] = bleService.inputHighWater();
+  diagnostic["ble_output_high_water"] = bleService.outputHighWater();
+  diagnostic["ble_input_queue_drops"] = bleService.inputQueueDrops();
+  diagnostic["ble_output_queue_drops"] = bleService.outputQueueDrops();
   diagnostic["network"] = networkService.tcpStatus();
   diagnostic["tcp_ready"] = networkService.tcpConnected();
   diagnostic["tcp_connects"] = networkService.tcpConnects();
@@ -310,7 +332,8 @@ void sendPingReply() {
   reply["ok"] = true;
   sendJson(reply);
   const bool usbAlive = usbLastInputAt && millis() - usbLastInputAt < 30000;
-  sendHello(networkService.tcpConnected() && !usbAlive ? "tcp" : "usb");
+  sendHello(processingBleLine ? "ble" :
+      networkService.tcpConnected() && !usbAlive ? "tcp" : "usb");
   sendDiagnostic();
 }
 
@@ -333,7 +356,8 @@ void setStatusFields(uint32_t now) {
   state.wifiStatus = networkService.wifiReady()
       ? String("WiFi ") + networkService.localIp().toString()
       : String("WiFi ") + networkService.wifiStatus();
-  state.networkStatus = String("TCP ") + networkService.tcpStatus();
+  state.networkStatus = bleService.connected() ? String("BLE ") + bleService.status()
+      : String("TCP ") + networkService.tcpStatus();
   state.audioStatus = playback.ready() ? "ES8311 16 kHz" : "audio unavailable";
   state.motionStatus = sensor.accelerationReady
       ? String("ACC ") + String(sensor.accelerationXG, 1) + "," +
@@ -341,9 +365,9 @@ void setStatusFields(uint32_t now) {
       : "IMU unavailable";
   state.freeHeap = ESP.getFreeHeap();
   state.wifiConnected = networkService.wifiReady();
-  state.bleConnected = false;
+  state.bleConnected = bleService.authenticated();
   state.linkStatus = usbLastInputAt && now - usbLastInputAt < 30000 ? "USB HOST" :
-      networkService.tcpConnected() ? "TCP HOST" : "USB READY";
+      networkService.tcpConnected() ? "TCP HOST" : bleService.authenticated() ? "BLE HOST" : "USB READY";
 }
 
 const char* moodName(const String& mood) {
@@ -529,13 +553,14 @@ void processLine(const char* line) {
     return;
   }
   if (!protocol::applyJsonFrame(state, String(line), now)) return;
+  if (!strcmp(type, "permission")) approvalFromBle = processingBleLine && state.approval.active;
   noteUsbActivity(network::HostActivity::ProtocolFrame);
   hostLastInputAt = now;
   const uint32_t receivedAt = millis();
   ++acceptedProtocolFrames;
   if (processingUsbLine) {
     ++acceptedUsbFrames;
-  } else {
+  } else if (!processingBleLine) {
     ++acceptedTcpFrames;
   }
   const bool stateFrame = request["total"].is<int>() || request["running"].is<int>() ||
@@ -547,7 +572,7 @@ void processLine(const char* line) {
     if (processingUsbLine) {
       ++acceptedUsbStateFrames;
       lastUsbStateFrameAt = receivedAt;
-    } else {
+    } else if (!processingBleLine) {
       ++acceptedTcpStateFrames;
       lastTcpStateFrameAt = receivedAt;
     }
@@ -587,7 +612,15 @@ void pollSerial() {
 
 void processTcpLine(const char* line, void*) {
   processingUsbLine = false;
+  processingBleLine = false;
   processLine(line);
+}
+
+void processBleLine(const char* line, void*) {
+  processingUsbLine = false;
+  processingBleLine = true;
+  processLine(line);
+  processingBleLine = false;
 }
 
 void loadNetworkConfiguration() {
@@ -774,6 +807,7 @@ void setup() {
       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   assets.begin();
   loadNetworkConfiguration();
+  bleService.begin();
   familiarUi.setFacePainter(paintFace);
   setStatusFields(millis());
   sendHello("usb");
@@ -798,6 +832,15 @@ void loop() {
   const uint32_t transportNow = millis();
   const bool usbAlive = usbLastInputAt && transportNow - usbLastInputAt < 30000;
   networkService.poll(usbAlive, processTcpLine, nullptr);
+  bleService.poll(processBleLine, nullptr);
+  if (bleService.disconnects() != observedBleDisconnects) {
+    observedBleDisconnects = bleService.disconnects();
+    if (approvalFromBle) {
+      state.approval = protocol::Approval();
+      state.dirty = true;
+      approvalFromBle = false;
+    }
+  }
   const uint32_t now = millis();
   pollPowerKey(now);
   pollBootButton();
