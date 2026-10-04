@@ -52,6 +52,12 @@ def test_flash_artifact_sizes_match_the_verified_v1_upload_layout(tmp_path):
         path.write_bytes(b"0" * size)
         artifacts[name] = path
     package.validate_flash_artifacts(artifacts)
+
+    artifacts["hermes-familiar-waveshare-349-v1.bin"].write_bytes(b"")
+    with pytest.raises(ValueError, match="hermes-familiar-waveshare-349-v1.bin"):
+        package.validate_flash_artifacts(artifacts)
+
+    artifacts["hermes-familiar-waveshare-349-v1.bin"].write_bytes(b"0")
     artifacts["boot_app0.bin"].unlink()
     with pytest.raises(ValueError, match="boot_app0.bin"):
         package.validate_flash_artifacts(artifacts)

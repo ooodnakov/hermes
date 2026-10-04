@@ -147,10 +147,19 @@ void V1Ble::onSubscribe(NimBLEConnInfo& info, uint16_t value) {
 }
 
 void V1Ble::resetSession() {
+  ++sessionResetCalls_;
   transport_.reset();
   connected_ = authenticated_ = subscribed_ = false;
   connectionHandle_ = BLE_HS_CONN_HANDLE_NONE;
   mtu_ = 23;
+}
+
+V1Ble::QueueStats V1Ble::queueStats() {
+  portENTER_CRITICAL(&mux_);
+  const QueueStats stats{
+      transport_.inputSize(), transport_.outputSize(), sessionResetCalls_};
+  portEXIT_CRITICAL(&mux_);
+  return stats;
 }
 
 void V1Ble::poll(LineHandler handler, void* context) {

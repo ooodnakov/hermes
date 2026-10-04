@@ -3,6 +3,20 @@
 Two integration modes, one device protocol. **Plugin mode is the product**;
 the bridge is the dev/remote fallback.
 
+The current device profile is Waveshare ESP32-S3-Touch-LCD-3.49 V1. The
+original 2.8-inch firmware is maintained as a separate legacy build.
+
+### V1 page map
+
+The V1 has eight tabs: **FACE** (avatar, live state, latest response),
+**MSGS** (two recent cards, retained-message reader, and five-entry history),
+**OPS** (six action slots and approval controls), **FLEET** (workers),
+**CRON** (scheduled jobs), **NET** (gateway/network state), **DEV** (board
+diagnostics), and **SET** (five themes, sound mute, animation, and brightness).
+The MSGS full-text reader fetches bounded UTF-8 chunks; the host retains up to
+40 records with bodies capped at 16 KiB each. Messages longer than that host
+retention limit are shortened.
+
 ## Mode 1 — native gateway plugin (recommended)
 
 `plugin/` installs as the Hermes plugin `familiar` (`./install.sh`, then
@@ -20,36 +34,44 @@ API server, no polling, and no separate daemon.
 | `pre_approval_request` | `type:permission` push — device jumps to ALLOW/DENY, `waiting=1` |
 | `post_approval_response` | pending cleared however it resolved (device, `/approve`, timeout) |
 
-A full state frame is also sent as a 5 s heartbeat (firmware marks the host
+A full state frame is also sent as a 2 s heartbeat (firmware marks the host
 offline after 30 s). Daily aggregates (sessions/tokens/tools) are read from
 `state.db` read-only at most once a minute.
 
-On V1, Page 1 presents two 55 px message cards. Tapping a card opens that
-entry's retained text; vertical swipes browse one entry at a time through
+On V1, Page 1 presents two 55 px message cards with two full preview lines.
+Tapping a card opens that entry's retained text; vertical swipes browse one entry at a time through
 five-entry history batches, and tapping returns to the prior card position.
 Page 0's latest-response Markdown viewer remains available separately.
 
-The plugin adds optional `entry_ids` beside the existing state `entries` and
-`ids` beside the existing history `lines`. A selected entry is requested with
-`{"cmd":"msg","id":"…"}` and returned as
-`{"type":"msg","id":"…","body":"…","role":"user|assistant|…","truncated":false}`.
-The ID arrays preserve the existing preview fields for older firmware. The
-host retains at most 40 detail records, with each stored body capped at 16 KiB
-of UTF-8. A detail response is limited to 3200 UTF-8 body bytes and a 4095-byte
-complete escaped JSON frame; the latter can shorten non-ASCII text further.
-The `truncated` flag reports clipping. A stale or unknown ID returns an empty
-body with `error:"stale"`; a preview-only legacy record returns
-`error:"unavailable"` so its compact preview is not presented as full text.
+The plugin adds optional `entry_ids` beside state `entries` and `ids` beside
+history `lines`. Previews contain up to 200 characters before complete-frame
+fitting. A selected entry is requested with
+`{"cmd":"msg","id":"…","offset":0}`; `offset` is a UTF-8 byte offset and
+may be omitted by older clients. Replies include `body`, `body_offset`,
+`body_total`, `has_more`, `retained_truncated`, and legacy `truncated`.
+The reader appends ordered chunks and requests the next offset until complete.
 
-Current rollout: the V1 messages/emoji image is flashed and hash-verified as
-`85029efd3a33f3f547cc8c844e34224f9c463ad1182b3f8aa58f12f1e5bfe90e`. This
-checkout's host plugin changes have not been deployed or live-updated in the
-gateway, so the connected device still receives preview-only records and the
-selected-message detail path is not yet available end to end. The existing
-Page 0 Markdown viewer remains in the image, though the user reports that
-Markdown formatting broke on the physical board. Treat this as an observed
-regression, not a formatting pass; do not infer a cause or investigate/fix it
-until asked.
+The host retains at most 40 detail records, each capped at 16 KiB of UTF-8.
+Each chunk is capped at 3200 UTF-8 bytes and a 4095-byte escaped JSON frame;
+escaping can reduce the chunk further. `retained_truncated` marks clipping at
+the 16 KiB source limit. Legacy `truncated` also remains true when `has_more`
+so older clients can report that their first chunk is incomplete. A stale ID
+returns `error:"stale"`, a preview-only record `error:"unavailable"`, and an
+invalid/out-of-range/mid-codepoint offset `error:"offset"`. Closing the reader,
+a late response, or a wrong offset cannot replace another selected message.
+If Markdown formatting limits are exhausted, the complete retained text stays
+scrollable with a simplified-format notice. Longer original messages show a
+shortening notice. At gateway startup, recent user/assistant messages are
+seeded read-only from `state.db` (up to 40 rows from the last 24 hours).
+
+Historical rollout evidence: the reader V1 image was flashed and hash-verified as
+`8819e97d9486ae66c44d38f3b7f49950ac5b9c506f402de520f584187508c9b4`.
+The matching plugin was deployed to the existing gateway with the user's
+approved graceful restart; settings were preserved. An authenticated live
+check received 209-character previews, five stable IDs, and all 16,384 retained
+bytes of a message in six valid chunks. That message's original body exceeded
+the retention cap. The user reports the UI mainly works and confirmed a short Yandex speech
+clip; broader audio validation remains pending. A later Gruvbox build is tracked separately in the handoff.
 
 Additional host→device frames (v0.3.0):
 
@@ -82,6 +104,9 @@ gateway.
 | `{"cmd":"msgs","off":0}` | return the selected five-entry history batch; response keeps `lines` and adds parallel `ids` |
 | `{"cmd":"msg","id":"…"}` | return full retained text for the selected entry, when available |
 | `{"cmd":"gesture","gesture":"shake"}` | ack event |
+
+Permission commands must include an explicit `decision` of `once` or `deny`;
+missing or malformed decisions are acknowledged without resolving the approval.
 
 ### Process safety
 
@@ -121,6 +146,21 @@ someone needs them on-device).
 - Gateway log lines are tagged `familiar` / `familiar.serial` / `familiar.actions`.
 - `tests/test_familiar_plugin.py` covers hook wiring, approval flow, and job
   control with a fake link (no device needed): `python3 -m pytest tests/ -q`.
+
+### Network and WSL audio reachability
+
+The gateway's device TCP listener uses port 8767 and its PCM HTTP listener
+uses port 8765. Under WSL or NAT, set `HERMES_ADVERTISED_HOST` in the gateway
+process environment to an IPv4 address the ESP32 can route to. Route-derived
+addresses can be private to WSL; configure the actual LAN route and firewall
+for the host in use. Keep both listeners limited to the trusted LAN. A local
+HTTP test does not prove that the board can reach the advertised address.
+Store Wi-Fi credentials and any transport token only in private gateway/SD
+configuration, never in the checked-in example or release metadata.
+
+The V1 device accepts audio playback but has no microphone recording or
+speech-to-text input path. Microphone capture is not part of the current
+firmware contract.
 
 ## Mode 2 — standalone bridge (dev / remote API)
 

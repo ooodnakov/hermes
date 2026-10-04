@@ -47,6 +47,16 @@ size_t Axs15231bDisplay::psramFrameBytes() const {
   return nativeFrame_ ? kNativePixels * sizeof(uint16_t) : 0;
 }
 
+bool Axs15231bDisplay::setBrightness(uint8_t percent) {
+  if (percent != 25 && percent != 50 && percent != 75 && percent != 100) return false;
+  if (backlightReady_) {
+    const uint8_t duty = static_cast<uint8_t>(((100 - percent) * 255 + 50) / 100);
+    if (!ledcWrite(board::kBacklight, duty)) return false;
+  }
+  brightnessPercent_ = percent;
+  return true;
+}
+
 void Axs15231bDisplay::cleanup() {
   // Never release DMA memory while the SPI driver may still be reading it.
   // A missing callback is treated as a fatal one-shot display failure.
@@ -133,7 +143,9 @@ bool Axs15231bDisplay::begin() {
 
   // Native glass orientation is 172x640; the caller paints at 640x172.
   // V1 drives the backlight with active-low PWM: duty 0 is fully on.
-  if (!ledcAttach(board::kBacklight, 50000, 8) || !ledcWrite(board::kBacklight, 0)) return fail();
+  if (!ledcAttach(board::kBacklight, 50000, 8)) return fail();
+  backlightReady_ = true;
+  if (!setBrightness(brightnessPercent_)) return fail();
   return true;
 }
 

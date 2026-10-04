@@ -119,6 +119,33 @@ void testOutputLimitsRejectFragmentedAdversarialMarkup() {
   assert(!ui::markdown::parse(longDestination, doc));
   assert(doc.text.empty() && doc.destinations.empty());
 }
+
+void testPrefixParsingRetainsValidContentAtOutputLimits() {
+  Document doc;
+  std::string manyBlocks;
+  for (std::size_t i = 0; i <= ui::markdown::kMaxBlocks; ++i)
+    manyBlocks += "## Heading\n";
+  assert(ui::markdown::parsePrefix(manyBlocks, doc));
+  assert(doc.truncated && doc.blocks.size() == ui::markdown::kMaxBlocks);
+
+  std::string manySpans;
+  for (std::size_t i = 0; i <= ui::markdown::kMaxSpans / 2; ++i)
+    manySpans += "**x** ";
+  assert(ui::markdown::parsePrefix(manySpans, doc));
+  assert(doc.truncated && doc.spans.size() == ui::markdown::kMaxSpans);
+  for (const auto& block : doc.blocks) {
+    assert(block.firstSpan + block.spanCount <= doc.spans.size());
+    for (std::size_t i = block.firstSpan; i < block.firstSpan + block.spanCount; ++i) {
+      const auto& span = doc.spans[i];
+      assert(span.textBegin + span.textLength <= doc.text.size());
+      assert(span.destinationBegin + span.destinationLength <= doc.destinations.size());
+    }
+  }
+
+  const std::string tooLong(ui::markdown::kMaxSourceBytes + 1, 'x');
+  assert(!ui::markdown::parsePrefix(tooLong, doc));
+  assert(doc.text.empty() && doc.blocks.empty() && doc.spans.empty() && !doc.truncated);
+}
 }  // namespace
 
 int main() {
@@ -128,5 +155,6 @@ int main() {
   testUnicodeAndEmptyParagraphs();
   testOversizedInputIsRejectedAndClearsOutput();
   testOutputLimitsRejectFragmentedAdversarialMarkup();
+  testPrefixParsingRetainsValidContentAtOutputLimits();
   std::cout << "Markdown parser native tests passed\n";
 }

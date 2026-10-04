@@ -29,6 +29,21 @@ bool textHas(const lgfx::LGFX_Sprite& sprite, const std::string& fragment) {
   return false;
 }
 
+bool hasTextWithFont(const lgfx::LGFX_Sprite& sprite, const std::string& text,
+                     const lgfx::IFont* font) {
+  for (const auto& call : sprite.calls)
+    if (call.text == text && call.font == font) return true;
+  return false;
+}
+
+bool hasTextCall(const lgfx::LGFX_Sprite& sprite, const std::string& text,
+                 int x, int y, float size) {
+  for (const auto& call : sprite.calls) {
+    if (call.text == text && call.x == x && call.y == y && call.size == size) return true;
+  }
+  return false;
+}
+
 bool isValidUtf8(const std::string& text) {
   for (size_t i = 0; i < text.size();) {
     const uint8_t lead = static_cast<uint8_t>(text[i]);
@@ -62,22 +77,22 @@ void testTabBoundariesAndDeckGaps() {
   protocol::UiState state;
   Capture sent;
   ui::FamiliarUi view(sprite, state, capture, &sent);
-  for (uint8_t i = 0; i < 7; ++i) {
+  for (uint8_t i = 0; i < 8; ++i) {
     const ui::Rect rect = ui::FamiliarUi::tabRect(i);
     assert(rect.x >= 0 && rect.w > 0 && rect.x + rect.w <= ui::FamiliarUi::kWidth);
     tap(view, rect.x, 10, 100 + i);
     assert(state.page == static_cast<protocol::Page>(i));
     tap(view, rect.x + rect.w - 1, 10, 200 + i);
     assert(state.page == static_cast<protocol::Page>(i));
-    if (i < 6) {
+    if (i < 7) {
       tap(view, rect.x + rect.w, 10, 250 + i);
       assert(state.page == static_cast<protocol::Page>(i + 1));
     }
   }
-  const ui::Rect last = ui::FamiliarUi::tabRect(6);
+  const ui::Rect last = ui::FamiliarUi::tabRect(7);
   assert(last.x + last.w == ui::FamiliarUi::kWidth);
   tap(view, ui::FamiliarUi::kWidth, 10, 300);
-  assert(state.page == protocol::Page::Device);
+  assert(state.page == protocol::Page::Settings);
 
   state.page = protocol::Page::Operations;
   state.deckCount = 6;
@@ -98,7 +113,7 @@ void testMessageCardGeometryTapAndModalReturn() {
   ui::FamiliarUi view(sprite, state, capture, &sent);
   state.page = protocol::Page::Messages;
   state.entryCount = 3;
-  state.entries[0] = "14:10 u: first user preview";
+  state.entries[0] = "14:10 w: first user preview";
   state.entries[1] = "14:11 a: second assistant preview";
   state.entries[2] = "14:12 u: third user preview";
   state.entryIds[0] = "first-user";
@@ -114,11 +129,15 @@ void testMessageCardGeometryTapAndModalReturn() {
   assert(ui::FamiliarUi::messageCardRect(2).w == 0);
 
   view.render(10);
-  assert(textHas(sprite, "USER"));
+  assert(textHas(sprite, "WORKER"));
   assert(textHas(sprite, "ASSISTANT"));
   assert(textHas(sprite, "OPEN >"));
   assert(textHas(sprite, "first user preview"));
   assert(textHas(sprite, "second assistant preview"));
+  assert(hasTextCall(sprite, "WORKER  14:10", first.x + 8, first.y + 4, 1.0f));
+  assert(hasTextCall(sprite, "ASSISTANT  14:11", second.x + 8, second.y + 4, 1.0f));
+  assert(hasTextCall(sprite, "OPEN >", first.x + first.w - 72, first.y + 4, 1.0f));
+  assertTextCallsFit(sprite);
 
   tap(view, 300, first.y + first.h + 1, 11);
   assert(!state.modalActive); // Card gap stays inert.
@@ -261,10 +280,12 @@ void testMessageIdentitySurvivesReorderAndSamePreview() {
   assert(textHas(sprite, "repeated preview"));
   tap(view, first.x + 10, first.y + 10, 16);
   assert(state.messageDetailRequestedId == "message-b");
-  view.render(8016); // Request timeout falls back to its selected preview.
+  state.messageDetailBody = "partial retained text";
+  view.render(8016); // A timeout leaves already received detail readable.
   assert(!state.messageDetailPending);
   assert(state.messageDetailError == "timeout");
-  assert(textHas(sprite, "full text unavailable"));
+  assert(textHas(sprite, "partial retained text"));
+  assert(textHas(sprite, "message incomplete"));
 }
 
 void testConfirmExpiry() {
@@ -434,11 +455,15 @@ void testUtf8TypographyMeasuredWrappingAcrossPages() {
   state.motionStatus = "движение: 0.02, 0.01, 1.00 g";
   state.linkStatus = "USB READY";
 
-  for (uint8_t page = 0; page < 7; ++page) {
+  for (uint8_t page = 0; page < 8; ++page) {
     state.page = static_cast<protocol::Page>(page);
     view.render(300 + page);
     assert(sprite.selectedFont == &fonts::efontJA_12 && !sprite.wrapX);
     assertTextCallsFit(sprite);
+    if (page == static_cast<uint8_t>(protocol::Page::Cron) ||
+        page == static_cast<uint8_t>(protocol::Page::Network)) {
+      assert(hasTextCall(sprite, "tap a line to read full text", 8, 159, 1.0f));
+    }
   }
 
   state.page = protocol::Page::Messages;
@@ -662,7 +687,7 @@ void testHostRowsCompactBlankParagraphsAndTapRenderedRow() {
   int secondRowY = -1;
   for (const auto& call : sprite.calls)
     if (call.text == "short row") secondRowY = call.y;
-  assert(secondRowY == 78);  // Two compact 13px lines plus two pixels of row padding.
+  assert(secondRowY == 86);  // Two font-height-plus-one lines plus row padding.
   tap(view, 20, secondRowY + 1, 101);
   assert(state.modalActive && state.modalBody == "short row");
   assert(state.modalReturn == protocol::Page::Fleet);
@@ -687,8 +712,8 @@ void testStatsModalRowsUseCompactMeasuredSpacing() {
     if (call.text == "up 3h17m serial") statsY[2] = call.y;
   }
   assert(statsY[0] == 50);
-  assert(statsY[1] == 65);
-  assert(statsY[2] == 80);
+  assert(statsY[1] == 69);
+  assert(statsY[2] == 88);
 
   state.modal.lines[0] = String(std::string(1000, 'x'));
   view.render(101);
@@ -697,10 +722,9 @@ void testStatsModalRowsUseCompactMeasuredSpacing() {
     if (call.text == "job idle Status brief") secondRowY = call.y;
     if (call.text == "up 3h17m serial") thirdRowY = call.y;
     if (call.text.find('x') != std::string::npos)
-      assert(call.y >= 50 && call.y + 12 <= 152);
+      assert(call.y >= 50 && call.y + 16 <= 152);
   }
-  assert(secondRowY == 117);  // Five visible lines, then 2px row padding.
-  assert(thirdRowY == 132);   // The following STATS rows keep one line each.
+  assert(secondRowY == 103 && thirdRowY == 122);  // Rows follow the larger measured font height.
 }
 
 void testLatestResponseOpensScrollableModalFromFaceAndMessages() {
@@ -749,6 +773,280 @@ void testLatestResponseOpensScrollableModalFromFaceAndMessages() {
   assert(state.modalBody == "Latest response preview");
   assert(!textHas(sprite, "Replacement B"));
 }
+
+void testFaceLatestPreviewStripsMarkdownSyntax() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  ui::FamiliarUi view(sprite, state, capture, nullptr);
+  state.connected = true;
+  state.lastSeenMs = 100;
+  state.page = protocol::Page::Face;
+  state.message = "## Latest **bold**\n\nA *small* `code` preview Привет 🚀";
+  view.render(101);
+  assert(textHas(sprite, "Latest"));
+  assert(textHas(sprite, "bold"));
+  assert(textHas(sprite, "small"));
+  assert(textHas(sprite, "code"));
+  assert(textHas(sprite, "Привет"));
+  assert(!textHas(sprite, "##"));
+  assert(!textHas(sprite, "**"));
+  assert(!textHas(sprite, "*small*"));
+  assert(hasTextWithFont(sprite, "bold", &fonts::efontJA_12_b));
+  bool codeStyled = false;
+  for (const auto& call : sprite.calls)
+    if (call.text == "code") codeStyled = call.foreground == 0x07F5 && call.background == 0x0841;
+  assert(codeStyled);
+  assertTextCallsFit(sprite);
+}
+
+void testMessageMarkdownForLegacyPreviewAndAsyncFullBody() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Messages;
+  state.entryCount = 1;
+  state.entries[0] = "14:10 a: **Legacy preview** with `code` and Привет 🚀";
+
+  const ui::Rect card = ui::FamiliarUi::messageCardRect(0);
+  view.render(100);
+  assert(textHas(sprite, "Legacy preview"));
+  assert(hasTextWithFont(sprite, "Legacy preview", &fonts::efontJA_12_b));
+  assert(textHas(sprite, "Привет"));
+  assert(!textHas(sprite, "**") && !textHas(sprite, "`"));
+  bool cardCodeStyled = false;
+  uint16_t previewCodeForeground = 0, previewCodeBackground = 0;
+  for (const auto& call : sprite.calls) {
+    if (call.text == "code") {
+      cardCodeStyled = call.foreground == 0x07F5 && call.background == 0x0841;
+      previewCodeForeground = call.foreground;
+      previewCodeBackground = call.background;
+    }
+  }
+  assert(cardCodeStyled);
+  const ui::Rect cardBody{static_cast<int16_t>(card.x + 8), static_cast<int16_t>(card.y + 19),
+                          static_cast<int16_t>(card.w - 16), static_cast<int16_t>(card.h - 20)};
+  for (const auto& call : sprite.calls) {
+    if (call.y < cardBody.y) continue;
+    assert(call.y + static_cast<int>(16 * call.size) <= cardBody.y + cardBody.h);
+    assert(call.x >= cardBody.x && call.x + call.width <= cardBody.x + cardBody.w);
+  }
+  assertTextCallsFit(sprite);
+
+  tap(view, card.x + 20, card.y + 30, 101);
+  assert(state.modalActive && !state.messageDetailPending);
+  view.render(102);
+  assert(textHas(sprite, "preview only"));
+  assert(textHas(sprite, "Legacy preview"));
+  assert(!textHas(sprite, "**"));
+  assert(hasTextWithFont(sprite, "Legacy preview", &fonts::efontJA_12_b));
+  bool modalCodeStyled = false;
+  for (const auto& call : sprite.calls) {
+    if (call.text == "code")
+      modalCodeStyled = call.foreground == previewCodeForeground &&
+                        call.background == previewCodeBackground;
+  }
+  assert(modalCodeStyled && textHas(sprite, "Привет"));
+  assert(!textHas(sprite, "**") && !textHas(sprite, "`"));
+  tap(view, 300, 100, 103);
+
+  state.entryIds[0] = "message-with-detail";
+  state.entries[0] = "14:11 a: preview text";
+  tap(view, card.x + 20, card.y + 30, 104);
+  assert(state.modalActive && state.messageDetailPending);
+  view.render(105);
+  assert(textHas(sprite, "loading full message"));
+  state.messageDetailBody = "# Full **async detail**";
+  state.messageDetailPending = false;
+  view.render(106);
+  assert(textHas(sprite, "Full"));
+  assert(textHas(sprite, "async detail"));
+  assert(!textHas(sprite, "#"));
+  assert(!textHas(sprite, "**"));
+  assert(hasTextWithFont(sprite, "async detail", &fonts::efontJA_12_b));
+}
+
+void testMessageCardsShowTwoFullFontLinesAndDetailReadsBeyondFirstFrame() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.page = protocol::Page::Messages;
+  state.entryCount = 1;
+  state.entries[0] = "14:10 a: **Line one**\nLine two";
+  state.entryIds[0] = "long-message";
+  const ui::Rect card = ui::FamiliarUi::messageCardRect(0);
+  view.render(10);
+  const int16_t bodyY = card.y + 19;
+  const int16_t secondLineY = bodyY + 17; // pinned efontJA_12 16 px height + 1 px gap
+  bool firstLine = false, secondLine = false;
+  for (const auto& call : sprite.calls) {
+    firstLine |= call.text == "Line one" && call.y == bodyY && call.size == 1.0f;
+    secondLine |= call.text == "Line two" && call.y == secondLineY && call.size == 1.0f;
+  }
+  assert(firstLine && secondLine);
+
+  tap(view, card.x + 20, card.y + 30, 20);
+  assert(state.modalActive && state.messageDetailPending);
+  assert(has(sent, "\"offset\":0"));
+  state.messageDetailBody = "**first page**";
+  state.messageDetailHasMore = true;
+  state.messageDetailNextOffset = 2800;
+  state.messageDetailPending = false;
+  view.tick(21);
+  assert(state.messageDetailPending && state.messageDetailRequestedOffset == 2800);
+  assert(has(sent, "\"offset\":2800"));
+
+  // A complete retained body may be larger than one JSON line; scrolling must
+  // still expose text from its end after the Markdown parser reads all bytes.
+  state.messageDetailBody = String(std::string(12000, 'x') + " TAIL-SENTINEL");
+  state.messageDetailPending = false;
+  state.messageDetailHasMore = false;
+  view.render(22);
+  assert(!textHas(sprite, "TAIL-SENTINEL"));
+  for (uint32_t i = 0; i < 80; ++i) {
+    view.touchGesture(300, 120, 300, 70, 100, 30 + i);
+    view.render(30 + i);
+  }
+  assert(textHas(sprite, "TAIL-SENTINEL"));
+}
+
+void testSettingsPageControlsAndHitRegions() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  for (uint8_t i = 0; i < 8; ++i) {
+    const ui::Rect tab = ui::FamiliarUi::tabRect(i);
+    for (uint8_t j = i + 1; j < 8; ++j) {
+      const ui::Rect other = ui::FamiliarUi::tabRect(j);
+      assert(tab.x + tab.w <= other.x);
+    }
+  }
+  const ui::Rect settingsTab = ui::FamiliarUi::tabRect(7);
+  tap(view, settingsTab.x + settingsTab.w / 2, 10, 100);
+  assert(state.page == protocol::Page::Settings);
+
+  const ui::Rect theme0 = ui::FamiliarUi::settingsThemeRect(0);
+  const ui::Rect theme1 = ui::FamiliarUi::settingsThemeRect(1);
+  const ui::Rect theme2 = ui::FamiliarUi::settingsThemeRect(2);
+  const ui::Rect theme3 = ui::FamiliarUi::settingsThemeRect(3);
+  const ui::Rect theme4 = ui::FamiliarUi::settingsThemeRect(4);
+  assert(theme0.x + theme0.w < theme1.x && theme1.x + theme1.w < theme2.x &&
+         theme2.x + theme2.w < theme3.x && theme3.x + theme3.w < theme4.x);
+  assert(theme4.x + theme4.w <= 632);
+  assert(ui::FamiliarUi::settingsThemeRect(5).w == 0);
+  const ui::Rect sound = ui::FamiliarUi::settingsSoundRect();
+  const ui::Rect animation = ui::FamiliarUi::settingsAnimationRect();
+  const ui::Rect brightness0 = ui::FamiliarUi::settingsBrightnessRect(0);
+  const ui::Rect brightness3 = ui::FamiliarUi::settingsBrightnessRect(3);
+  assert(theme0.y + theme0.h < sound.y && sound.x + sound.w < animation.x);
+  assert(sound.y + sound.h < brightness0.y && brightness3.x + brightness3.w <= 632);
+  for (uint8_t i = 0; i < 4; ++i)
+    for (uint8_t j = i + 1; j < 4; ++j) {
+      const ui::Rect a = ui::FamiliarUi::settingsBrightnessRect(i);
+      const ui::Rect b = ui::FamiliarUi::settingsBrightnessRect(j);
+      assert(a.x + a.w < b.x);
+    }
+
+  tap(view, theme1.x + theme1.w / 2, theme1.y + theme1.h / 2, 101);
+  assert(state.themeId == 1 && state.uiSettingsDirty);
+  state.uiSettingsDirty = false;
+  tap(view, theme4.x + theme4.w / 2, theme4.y + theme4.h / 2, 102);
+  assert(state.themeId == static_cast<uint8_t>(ui::themes::Id::Gruvbox));
+  assert(state.uiSettingsDirty);
+  view.render(102);
+  bool gruvboxColorsRendered = false;
+  for (const auto& call : sprite.calls)
+    if (call.text == "SETTINGS")
+      gruvboxColorsRendered = call.foreground == ui::themes::get(ui::themes::Id::Gruvbox).text &&
+                              call.background == ui::themes::get(ui::themes::Id::Gruvbox).background;
+  assert(gruvboxColorsRendered);
+  state.uiSettingsDirty = false;
+  tap(view, sound.x + 20, sound.y + 10, 103);
+  assert(state.soundMuted && state.uiSettingsDirty);
+  state.uiSettingsDirty = false;
+  tap(view, animation.x + 20, animation.y + 10, 103);
+  assert(!state.animationEnabled && state.uiSettingsDirty);
+  state.uiSettingsDirty = false;
+  tap(view, brightness0.x + brightness0.w / 2, brightness0.y + brightness0.h / 2, 104);
+  assert(state.brightnessPercent == 25 && state.uiSettingsDirty);
+
+  view.render(105);
+  assert(textHas(sprite, "SOUND  MUTED"));
+  assert(textHas(sprite, "ANIMATION  PAUSED"));
+  assert(textHas(sprite, "25%"));
+  assertTextCallsFit(sprite);
+}
+
+void testPaperThemeWhiteBackgroundSentinelAndMarkdownPanels() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  const ui::Rect settingsTab = ui::FamiliarUi::tabRect(7);
+  tap(view, settingsTab.x + settingsTab.w / 2, 10, 100);
+  view.render(101);
+
+  bool paperNameKeepsWhiteTile = false;
+  bool paperPreviewKeepsWhiteTile = false;
+  for (const auto& call : sprite.calls) {
+    if (call.text == "Paper")
+      paperNameKeepsWhiteTile = call.foreground == 0x1082 && call.background == 0xFFFF;
+    if (call.text == "PREVIEW" && call.background == 0xFFFF)
+      paperPreviewKeepsWhiteTile = true;
+  }
+  assert(paperNameKeepsWhiteTile && paperPreviewKeepsWhiteTile);
+
+  const ui::Rect paper = ui::FamiliarUi::settingsThemeRect(3);
+  tap(view, paper.x + paper.w / 2, paper.y + paper.h / 2, 102);
+  view.render(103);
+  bool settingsUsesWhiteBackground = false;
+  bool settingsTextUsesWhiteBackground = false;
+  for (const auto& call : sprite.calls) {
+    if (call.text == "SETTINGS" && call.background == 0xFFFF)
+      settingsUsesWhiteBackground = true;
+    if (call.text == "SOUND  ON" && call.background == 0xFFFF)
+      settingsTextUsesWhiteBackground = true;
+  }
+  assert(settingsUsesWhiteBackground && settingsTextUsesWhiteBackground);
+
+  state.page = protocol::Page::Messages;
+  state.entryCount = 1;
+  state.entries[0] = "14:10 a: Paper `message code`";
+  view.render(104);
+  bool messageCodeUsesPaperPalette = false;
+  for (const auto& call : sprite.calls)
+    if (call.text == "message code")
+      messageCodeUsesPaperPalette = call.foreground == 0x2017 && call.background == 0xEF5D;
+  assert(messageCodeUsesPaperPalette);
+
+  state.page = protocol::Page::Face;
+  state.message = "Paper `face code`";
+  view.render(105);
+  bool faceCodeUsesPaperPalette = false;
+  for (const auto& call : sprite.calls)
+    if (call.text == "face code")
+      faceCodeUsesPaperPalette = call.foreground == 0x2017 && call.background == 0xEF5D;
+  assert(faceCodeUsesPaperPalette);
+}
+
+void testResponseOverflowKeepsFormattedPrefixAndShowsFooter() {
+  lgfx::LGFX_Sprite sprite;
+  protocol::UiState state;
+  Capture sent;
+  ui::FamiliarUi view(sprite, state, capture, &sent);
+  state.connected = true;
+  state.lastSeenMs = 100;
+  state.page = protocol::Page::Face;
+  for (int i = 0; i <= static_cast<int>(ui::markdown::kMaxBlocks); ++i)
+    state.agentResponseMarkdown += String("## Heading ") + String(i) + "\n";
+  tap(view, 180, 120, 101);
+  view.render(102);
+  assert(textHas(sprite, "Heading"));
+  assert(!textHas(sprite, "##"));
+  assert(textHas(sprite, "response shortened"));
+}
 }  // namespace
 
 int main() {
@@ -767,5 +1065,11 @@ int main() {
   testHostRowsCompactBlankParagraphsAndTapRenderedRow();
   testStatsModalRowsUseCompactMeasuredSpacing();
   testLatestResponseOpensScrollableModalFromFaceAndMessages();
+  testFaceLatestPreviewStripsMarkdownSyntax();
+  testMessageMarkdownForLegacyPreviewAndAsyncFullBody();
+  testMessageCardsShowTwoFullFontLinesAndDetailReadsBeyondFirstFrame();
+  testSettingsPageControlsAndHitRegions();
+  testPaperThemeWhiteBackgroundSentinelAndMarkdownPanels();
+  testResponseOverflowKeepsFormattedPrefixAndShowsFooter();
   std::cout << "Familiar UI native regression tests passed\n";
 }

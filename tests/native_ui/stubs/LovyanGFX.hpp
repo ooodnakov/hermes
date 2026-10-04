@@ -24,6 +24,7 @@ struct TextCall {
   int x = 0, y = 0, width = 0;
   float size = 1.0f;
   uint16_t foreground = 0, background = 0;
+  const IFont* font = nullptr;
 };
 
 struct ImageCall {
@@ -46,6 +47,12 @@ class LGFX_Sprite {
     imageCalls.push_back(call);
   }
   void setFont(const IFont* font) { selectedFont = font; }
+  void setClipRect(int x, int y, int w, int h) {
+    clipX = x; clipY = y; clipW = w; clipH = h;
+  }
+  void getClipRect(int* x, int* y, int* w, int* h) const {
+    *x = clipX; *y = clipY; *w = clipW; *h = clipH;
+  }
   void setTextWrap(bool x, bool y = false) { wrapX = x; wrapY = y; }
   void setTextSize(float size) { textSize = size; }
   void setTextColor(uint16_t foreground, uint16_t background) {
@@ -61,7 +68,8 @@ class LGFX_Sprite {
     }
     return static_cast<int>(width * textSize);
   }
-  int fontHeight() const { return static_cast<int>(12 * textSize); }
+  // Pinned LovyanGFX efontJA_12 uses max_char_height() == 16.
+  int fontHeight() const { return static_cast<int>(16 * textSize); }
   void print(const String& value) { record(value); }
   void print(const char* value) { record(String(value)); }
   void printf(const char* format, ...) {
@@ -78,12 +86,14 @@ class LGFX_Sprite {
   float textSize = 1.0f;
   std::vector<TextCall> calls;
   std::vector<ImageCall> imageCalls;
+  int clipX = 0, clipY = 0, clipW = 640, clipH = 172;
 
  private:
   int cursorX = 0, cursorY = 0;
   uint16_t fg = 0, bg = 0;
   void record(const String& value) {
-    calls.push_back({value.str(), cursorX, cursorY, textWidth(value), textSize, fg, bg});
+    calls.push_back({value.str(), cursorX, cursorY, textWidth(value), textSize, fg, bg,
+                     selectedFont});
   }
 };
 }  // namespace lgfx

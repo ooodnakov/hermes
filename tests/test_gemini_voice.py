@@ -210,7 +210,7 @@ class YandexVoiceTests(unittest.TestCase):
     def test_request_form_auth_and_lpcm_wav_output(self):
         pcm = b"\x00\x00\xff\x7f\x00\x80\x34\xf2"
         fake = FakeResponse(pcm, headers={"Content-Length": str(len(pcm)),
-                                          "Content-Type": "audio/lpcm"})
+                                          "Content-Type": "audio/x-pcm;bit=16;rate=16000"})
         with patch.object(voice.urllib.request, "urlopen", return_value=fake) as open_url:
             output = voice._yandex_render("Привет, мир!")
         self.assertIsNotNone(output)
@@ -248,6 +248,16 @@ class YandexVoiceTests(unittest.TestCase):
     def test_rejects_non_lpcm_and_wrong_sample_rate_content_types(self):
         for content_type in ("audio/mpeg", "audio/lpcm;rate=24000",
                              "audio/lpcm;codec=alaw", "audio/lpcm;channels=2"):
+            with self.subTest(content_type=content_type), \
+                 patch.object(voice.urllib.request, "urlopen",
+                              return_value=FakeResponse(
+                                  b"\0\0", headers={"Content-Type": content_type})):
+                self.assertIsNone(voice._yandex_render("test"))
+
+    def test_rejects_malformed_audio_x_pcm_parameters(self):
+        for content_type in ("audio/x-pcm;bit=8;rate=16000",
+                             "audio/x-pcm;rate=24000",
+                             "audio/x-pcm;channels=2"):
             with self.subTest(content_type=content_type), \
                  patch.object(voice.urllib.request, "urlopen",
                               return_value=FakeResponse(

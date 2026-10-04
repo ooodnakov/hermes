@@ -124,6 +124,8 @@ def _pcm_content_type_matches(value: str, media_types: tuple[str, ...],
         return False
     if "codec" in params and params["codec"] != "pcm":
         return False
+    if "bit" in params and params["bit"] != "16":
+        return False
     return True
 
 
@@ -389,7 +391,7 @@ def _yandex_render(text: str) -> Path | None:
                 return None
             content_type = str(response.headers.get("Content-Type") or "").lower()
             if content_type and not _pcm_content_type_matches(
-                    content_type, ("audio/lpcm", "audio/pcm", "audio/l16",
+                    content_type, ("audio/lpcm", "audio/pcm", "audio/l16", "audio/x-pcm",
                                    "application/octet-stream"), 16000):
                 logger.warning("Yandex SpeechKit returned an unsupported content type")
                 return None

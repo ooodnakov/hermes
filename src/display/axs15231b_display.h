@@ -16,6 +16,10 @@ class Axs15231bDisplay {
   Axs15231bDisplay& operator=(const Axs15231bDisplay&) = delete;
 
   bool begin();
+  // V1 backlight is active-low: 100% is duty 0 and 25% is duty 191.
+  // Supported values match the Settings page's discrete choices.
+  bool setBrightness(uint8_t percent);
+  uint8_t brightnessPercent() const { return brightnessPercent_; }
   // Input is a complete 640x172 RGB565 frame. Partial rectangles are not
   // supported by the AXS15231B sequential QSPI stream used by this board.
   bool present(const uint16_t* logicalFrame, size_t pixelCount);
@@ -32,6 +36,8 @@ class Axs15231bDisplay {
   bool busInitialized_ = false;
   bool failed_ = false;
   bool transferInFlight_ = false;
+  bool backlightReady_ = false;
+  uint8_t brightnessPercent_ = 100;
 };
 
 }  // namespace display

@@ -1,5 +1,12 @@
 # V1 physical gesture check
 
+This procedure is retained as diagnostic documentation. At migration closeout
+on 2026-10-04, the user accepted the unperformed extended gesture, workload,
+and failure/power checks as limitations; no new physical run is implied by
+the checked migration tasks. Use this procedure only when physical gesture
+evidence is requested again. Earlier reset causes described below remain
+unknown.
+
 The host sensor test checks the detector against controlled acceleration samples. This board check separately records gestures emitted by the running firmware; it does not treat an operator confirmation as evidence.
 
 ## Current priority: resolve the silent serial capture

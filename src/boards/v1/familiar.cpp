@@ -9,6 +9,7 @@
 #include "../../peripherals/sensors.h"
 #include "../../peripherals/bus_lock.h"
 #include "../../protocol/serial_line_framer.h"
+#include "../../protocol/notification_sound.h"
 #include "../../protocol/speech_dispatch.h"
 #include "../../protocol/ui_state.h"
 #include "../../storage/v1_assets.h"
@@ -283,13 +284,21 @@ void sendDiagnostic() {
   diagnostic["ble_rejected_writes"] = bleService.rejectedWrites();
   diagnostic["ble_framing_errors"] = bleService.framingErrors();
   diagnostic["ble_notify_failures"] = bleService.notifyFailures();
+  const network::V1Ble::QueueStats bleQueueStats = bleService.queueStats();
+  diagnostic["ble_input_queued_bytes"] = bleQueueStats.inputQueuedBytes;
+  diagnostic["ble_output_queued_bytes"] = bleQueueStats.outputQueuedBytes;
   diagnostic["ble_input_high_water"] = bleService.inputHighWater();
   diagnostic["ble_output_high_water"] = bleService.outputHighWater();
   diagnostic["ble_input_queue_drops"] = bleService.inputQueueDrops();
   diagnostic["ble_output_queue_drops"] = bleService.outputQueueDrops();
+  diagnostic["ble_session_reset_calls"] = bleQueueStats.sessionResetCalls;
   diagnostic["network"] = networkService.tcpStatus();
   diagnostic["tcp_ready"] = networkService.tcpConnected();
   diagnostic["tcp_connects"] = networkService.tcpConnects();
+  diagnostic["ui_theme"] = state.themeId;
+  diagnostic["ui_sound_muted"] = state.soundMuted;
+  diagnostic["ui_animation_enabled"] = state.animationEnabled;
+  diagnostic["ui_brightness_percent"] = state.brightnessPercent;
   diagnostic["tcp_disconnects"] = networkService.tcpDisconnects();
   diagnostic["tcp_framing_errors"] = networkService.framingErrors();
   diagnostic["tcp_configured"] = networkService.tcpConfigured();
@@ -379,9 +388,10 @@ const char* moodName(const String& mood) {
 
 void paintFace(lgfx::LGFX_Sprite& sprite, const String& mood,
                const ui::Rect& rect, uint32_t nowMs, void*) {
+  const ui::themes::Palette& palette = ui::themes::get(state.themeId);
   if (!artworkScratch) {
-    sprite.drawRoundRect(rect.x + 30, rect.y + 42, 84, 60, 10, TFT_GREEN);
-    sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+    sprite.drawRoundRect(rect.x + 30, rect.y + 42, 84, 60, 10, palette.accent);
+    sprite.setTextColor(palette.text, palette.background);
     sprite.setCursor(rect.x + 65, rect.y + 65);
     sprite.print("H");
     return;
@@ -393,15 +403,21 @@ void paintFace(lgfx::LGFX_Sprite& sprite, const String& mood,
     artworkFrameCount = 1;
     artworkFrameMs = 180;
   }
-  const uint16_t frame = static_cast<uint16_t>(((nowMs - artworkMoodStartedAt) / artworkFrameMs) % artworkFrameCount);
+  const uint16_t frame = state.animationEnabled
+      ? static_cast<uint16_t>(((nowMs - artworkMoodStartedAt) / artworkFrameMs) % artworkFrameCount)
+      : 0;
   if (assets.loadMoodFrame(selectedMood, frame, artworkScratch, kArtworkPixels, &lastFrameInfo)) {
     artworkFrameCount = lastFrameInfo.frameCount ? lastFrameInfo.frameCount : 1;
     artworkFrameMs = lastFrameInfo.frameMs ? lastFrameInfo.frameMs : 180;
+    if (state.themeId != static_cast<uint8_t>(ui::themes::Id::Phosphor)) {
+      for (size_t i = 0; i < kArtworkPixels; ++i)
+        artworkScratch[i] = ui::themes::avatarColor(artworkScratch[i], state.themeId);
+    }
     sprite.pushImage(rect.x, rect.y, storage::kCharacterWidth, storage::kCharacterHeight, artworkScratch);
   } else {
-    sprite.fillRect(rect.x, rect.y, rect.w, rect.h, TFT_BLACK);
-    sprite.drawRoundRect(rect.x + 24, rect.y + 38, 96, 68, 12, TFT_GREEN);
-    sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+    sprite.fillRect(rect.x, rect.y, rect.w, rect.h, palette.background);
+    sprite.drawRoundRect(rect.x + 24, rect.y + 38, 96, 68, 12, palette.accent);
+    sprite.setTextColor(palette.text, palette.background);
     sprite.setCursor(rect.x + 65, rect.y + 65);
     sprite.print("H");
   }
@@ -584,6 +600,16 @@ void processLine(const char* line) {
     if (!playback.playUrl(url)) state.message = playback.ready() ? "Speech playback unavailable" : "Audio unavailable";
     else state.message = "Playing speech";
     state.dirty = true;
+  } else {
+    const bool soundProvided = !request["sound"].isUnbound();
+    const char* sound = request["sound"].is<const char*>()
+        ? request["sound"].as<const char*>() : nullptr;
+    switch (protocol::notificationSoundForFrame(type, sound, soundProvided, false)) {
+      case protocol::NotificationSound::Alert: playback.chirp("alert"); break;
+      case protocol::NotificationSound::Ack: playback.chirp("ack"); break;
+      case protocol::NotificationSound::Tap: playback.chirp("tap"); break;
+      case protocol::NotificationSound::None: break;
+    }
   }
   setStatusFields(now);
 }
@@ -638,6 +664,41 @@ void loadNetworkConfiguration() {
   if (error || !config.is<JsonObject>()) return;
   networkService.configure(config["wifi"].as<JsonObjectConst>(), config["host"].as<JsonObjectConst>());
   networkService.begin();
+  const JsonObjectConst uiPrefs = config["ui"].as<JsonObjectConst>();
+  if (uiPrefs["theme"].is<uint8_t>() && uiPrefs["theme"].as<uint8_t>() < ui::themes::count())
+    state.themeId = uiPrefs["theme"].as<uint8_t>();
+  if (uiPrefs["sound_muted"].is<bool>()) state.soundMuted = uiPrefs["sound_muted"].as<bool>();
+  if (uiPrefs["animation_enabled"].is<bool>())
+    state.animationEnabled = uiPrefs["animation_enabled"].as<bool>();
+  if (uiPrefs["brightness_percent"].is<uint8_t>()) {
+    const uint8_t brightness = uiPrefs["brightness_percent"].as<uint8_t>();
+    if (brightness == 25 || brightness == 50 || brightness == 75 || brightness == 100) {
+      if (lcd.setBrightness(brightness)) state.brightnessPercent = brightness;
+      else state.brightnessPercent = lcd.brightnessPercent();
+    }
+  }
+  playback.setQuiet(quietMode || state.soundMuted);
+}
+
+void saveUiSettingsIfNeeded(uint32_t now) {
+  if (!state.uiSettingsDirty) return;
+  state.uiSettingsDirty = false;
+  const bool brightnessApplied = lcd.setBrightness(state.brightnessPercent);
+  if (!brightnessApplied) state.brightnessPercent = lcd.brightnessPercent();
+  playback.setQuiet(quietMode || state.soundMuted);
+
+  JsonDocument updates;
+  updates["ui"]["theme"] = state.themeId;
+  updates["ui"]["sound_muted"] = state.soundMuted;
+  updates["ui"]["animation_enabled"] = state.animationEnabled;
+  updates["ui"]["brightness_percent"] = state.brightnessPercent;
+  const bool saved = assets.mergeConfiguration(updates.as<JsonObjectConst>());
+  state.toast = !brightnessApplied ? (saved ? "Brightness change failed" : "Brightness and save failed")
+      : saved ? "Settings saved" : !assets.sdReady()
+          ? "Settings active for session - SD unavailable"
+          : "Settings active for session - save failed";
+  state.toastUntilMs = now + 3500;
+  state.dirty = true;
 }
 
 void pollTouch(uint32_t now) {
@@ -670,7 +731,7 @@ void pollTouch(uint32_t now) {
     ++touchGestureCount;
     familiarUi.touchGesture(touchStartX, touchStartY, touchLastX, touchLastY,
                             now - touchStartedAt, now);
-    if (!quietMode) playback.chirp("tap");
+    if (!quietMode && !state.soundMuted) playback.chirp("tap");
   }
 }
 
@@ -682,12 +743,12 @@ void pollPhysicalGesture() {
   bool hasQuiet = false;
   if (sensor.gesture == peripherals::Gesture::FaceDown) {
     quietMode = true;
-    playback.setQuiet(true);
+    playback.setQuiet(quietMode || state.soundMuted);
     name = "facedown";
     hasQuiet = true;
   } else if (sensor.gesture == peripherals::Gesture::Upright) {
     quietMode = false;
-    playback.setQuiet(false);
+    playback.setQuiet(state.soundMuted);
     name = "upright";
     hasQuiet = true;
   } else if (sensor.gesture == peripherals::Gesture::Shake) {
@@ -703,7 +764,7 @@ void pollPhysicalGesture() {
   event["gesture"] = name;
   if (hasQuiet) event["quiet"] = quietMode;
   sendJson(event);
-  if (!quietMode && (sensor.gesture == peripherals::Gesture::Upright ||
+  if (!quietMode && !state.soundMuted && (sensor.gesture == peripherals::Gesture::Upright ||
                      sensor.gesture == peripherals::Gesture::Shake)) {
     playback.chirp("ack");
   }
@@ -854,6 +915,7 @@ void loop() {
     lastStatusUpdateAt = now;
   }
   pollTouch(now);
+  saveUiSettingsIfNeeded(now);
   sendTelemetry(now);
 
   familiarUi.tick(now);

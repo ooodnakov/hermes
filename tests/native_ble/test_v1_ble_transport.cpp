@@ -13,6 +13,7 @@ int main() {
 
   const uint8_t first[] = {'{', '}', '\n', 'a'};
   assert(transport.enqueueInput(first, sizeof(first)));
+  assert(transport.inputSize() == sizeof(first));
   assert(transport.nextLine() == Result::LineReady);
   assert(!strcmp(transport.line(), "{}"));
   const uint8_t rest[] = {'b', '\r', '\n', '\n'};
@@ -48,6 +49,7 @@ int main() {
 
   assert(transport.enqueueOutput("one"));
   assert(transport.enqueueOutput("two"));
+  assert(transport.outputSize() == 8);
   uint8_t output[8]{};
   assert(transport.peekOutput(output, 5) == 5);
   assert(std::string(reinterpret_cast<char*>(output), 5) == "one\nt");
@@ -58,7 +60,13 @@ int main() {
   std::string tooLong(V1BleTransport::kMaxLine + 1, 'x');
   assert(!transport.enqueueOutput(tooLong.c_str()));
   assert(transport.outputQueueDrops() == 1);
+  const size_t inputHighWaterBeforeReset = transport.inputHighWater();
+  const size_t outputHighWaterBeforeReset = transport.outputHighWater();
   transport.reset();
   assert(transport.inputSize() == 0);
   assert(transport.outputSize() == 0);
+  assert(transport.inputHighWater() == inputHighWaterBeforeReset);
+  assert(transport.outputHighWater() == outputHighWaterBeforeReset);
+  assert(transport.inputQueueDrops() == 1);
+  assert(transport.outputQueueDrops() == 1);
 }

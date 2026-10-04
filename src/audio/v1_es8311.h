@@ -74,7 +74,7 @@ class V1Es8311 {
 
  private:
   bool writeMonoSamples(const int16_t* samples, size_t count, uint32_t timeoutMs);
-  bool emitTone(uint16_t hz, uint16_t ms, bool& outputActive);
+  bool emitTone(uint16_t hz, uint16_t ms, uint8_t gainRegister, bool& outputActive);
   bool playUrlWorker(const String& url);
   bool claimSpeech();
   void releaseSpeech();

@@ -4,7 +4,7 @@
 
 namespace protocol {
 
-enum class Page : uint8_t { Face, Messages, Operations, Fleet, Cron, Network, Device, Count };
+enum class Page : uint8_t { Face, Messages, Operations, Fleet, Cron, Network, Device, Settings, Count };
 
 struct DeckAction {
   String label;
@@ -50,6 +50,10 @@ struct UiState {
   String messageDetailError;
   bool messageDetailPending = false;
   bool messageDetailTruncated = false;
+  bool messageDetailHasMore = false;
+  uint32_t messageDetailRequestedOffset = 0;
+  uint32_t messageDetailNextOffset = 0;
+  uint32_t messageDetailTotalBytes = 0;
   // Optional full Markdown response paired with the concise `message` preview.
   // The protocol parser bounds this to a complete UTF-8 prefix of the frame.
   String agentResponseMarkdown;
@@ -72,6 +76,11 @@ struct UiState {
   uint32_t freeHeap = 0;
   uint8_t rotation = 0;
   bool bleConnected = false, wifiConnected = false;
+  uint8_t themeId = 0;
+  uint8_t brightnessPercent = 100;
+  bool soundMuted = false;
+  bool animationEnabled = true;
+  bool uiSettingsDirty = false;
   bool dirty = true;
 };
 

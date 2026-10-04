@@ -5,6 +5,7 @@
 
 #include "../protocol/ui_state.h"
 #include "markdown.h"
+#include "themes.h"
 
 namespace ui {
 
@@ -40,6 +41,10 @@ class FamiliarUi {
   static Rect approvalTextRect();
   static Rect artRect();
   static Rect messageCardRect(uint8_t index);
+  static Rect settingsThemeRect(uint8_t index);
+  static Rect settingsSoundRect();
+  static Rect settingsAnimationRect();
+  static Rect settingsBrightnessRect(uint8_t index);
 
  private:
   lgfx::LGFX_Sprite& sprite_;
@@ -55,6 +60,7 @@ class FamiliarUi {
   bool responseParseReady_ = false;
   bool agentResponseModalTruncated_ = false;
   bool messageDetailModal_ = false;
+  bool messageDetailSimplified_ = false;
   bool pendingHistorySelection_ = false;
   uint16_t pendingHistoryOffset_ = 0;
   uint8_t pendingMessageSelection_ = 0;
@@ -62,6 +68,16 @@ class FamiliarUi {
   uint32_t messageDetailRequestedAtMs_ = 0;
   String messageSelectionId_;
   markdown::Document responseDocument_;
+  struct MarkdownPreviewCache {
+    markdown::Document document;
+    uint32_t hash = 0;
+    bool ready = false;
+  };
+  MarkdownPreviewCache facePreviewCache_;
+  MarkdownPreviewCache messagePreviewCaches_[2];
+  uint16_t kBg = 0x0000, kPanel = 0x0841, kDim = 0x7BEF;
+  uint16_t kGreen = 0xAFE5, kInk = 0xDFFF, kAmber = 0xFEE0, kRed = 0xF965;
+  uint16_t kCyan = 0x07F5;
 
   void emit(const String& json);
   void drawTabs(uint16_t accent);
@@ -69,17 +85,19 @@ class FamiliarUi {
   void drawFace();
   void drawMessages();
   void openMessage(uint8_t index, bool history);
+  void requestMessageDetail(uint32_t offset);
   void browseMessages(bool older);
   void drawOperations();
+  void drawSettings();
   void drawHostPage(const protocol::HostPage& page, const char* fallback);
   void drawModal();
   void drawMarkdownResponse();
   void ensureResponseParsed();
   void drawText(const String& text, int16_t x, int16_t y, int16_t width,
                 uint16_t color, float size = 1.0f, bool ellipsis = true,
-                uint16_t background = 0x0000);
+                uint32_t background = UINT32_MAX);
   void drawCenteredText(const String& text, const Rect& rect, uint16_t color,
-                        float size = 1.0f, uint16_t background = 0x0000);
+                        float size = 1.0f, uint32_t background = UINT32_MAX);
   void drawWrapped(const String& text, int16_t x, int16_t y, int16_t width,
                    int16_t height, uint16_t color, float scale = 1.0f,
                    uint16_t skipLines = 0);

@@ -67,6 +67,69 @@ jobs:
           package_firmware waveshare_esp32_s3_touch_lcd_28 \
             firmware-legacy-28 firmware-legacy-2.8.bin
 
+      - name: Package and verify complete V1 release bundle
+        env:
+          BUNDLE_ROOT: dist/ci-waveshare-349-v1
+        run: |
+          set -euo pipefail
+          python scripts/package_v1_release.py --out "$BUNDLE_ROOT"
+          python - "$BUNDLE_ROOT" <<'PY'
+          import filecmp
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve()
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          if manifest.get("profile") != "waveshare-esp32-s3-touch-lcd-349-v1":
+              raise SystemExit("unexpected release bundle profile")
+          source = manifest["source"]
+          if source["commit"] != os.environ["GITHUB_SHA"] or source["dirty"]:
+              raise SystemExit("release bundle source is not the clean workflow checkout")
+
+          records = manifest.get("files", [])
+          by_path = {record["path"]: record for record in records}
+          if len(by_path) != len(records):
+              raise SystemExit("duplicate paths in release manifest")
+          actual_paths = {
+              path.relative_to(root).as_posix()
+              for path in root.rglob("*")
+              if path.is_file() and path != root / "manifest.json"
+          }
+          if actual_paths != set(by_path):
+              raise SystemExit("release manifest file list does not match bundle contents")
+
+          for relative, record in by_path.items():
+              path = (root / relative).resolve()
+              if root not in path.parents or not path.is_file():
+                  raise SystemExit(f"invalid release manifest path: {relative}")
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if path.stat().st_size != record["size_bytes"] or digest != record["sha256"]:
+                  raise SystemExit(f"release manifest size/hash mismatch: {relative}")
+
+          firmware = manifest["firmware"]
+          firmware_record = by_path[firmware["path"]]
+          if (firmware_record["size_bytes"] != firmware["size_bytes"]
+                  or firmware_record["sha256"] != firmware["sha256"]):
+              raise SystemExit("firmware metadata does not match the packaged image")
+          build_image = Path(".pio/build/waveshare_esp32_s3_touch_lcd_349_v1/firmware.bin")
+          if not filecmp.cmp(root / firmware["path"], build_image, shallow=False):
+              raise SystemExit("release application differs from the V1 build image")
+          assets = manifest["sd_assets"]
+          frames = assets["frames"]
+          if (assets["frame_count"] != 20 or len(frames) != 20
+                  or any(frame["size_bytes"] != 640 * 172 // 2 for frame in frames)):
+              raise SystemExit("unexpected V1 SD asset frame metadata")
+          for frame in frames:
+              frame_record = by_path[f'{assets["directory"]}/{frame["path"]}']
+              if (frame_record["size_bytes"] != frame["size_bytes"]
+                      or frame_record["sha256"] != frame["sha256"]):
+                  raise SystemExit(f"SD frame metadata mismatch: {frame['path']}")
+          print(f"Verified {len(records)} release files and {assets['frame_count']} SD frames")
+          PY
+
       - uses: actions/upload-artifact@v7
         with:
           name: firmware-349-v1
@@ -83,4 +146,10 @@ jobs:
         with:
           name: firmware-legacy-28
           path: ${{ runner.temp }}/espherm-firmware/firmware-legacy-28/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hermes-familiar-waveshare-349-v1-release
+          path: dist/ci-waveshare-349-v1/
           if-no-files-found: error

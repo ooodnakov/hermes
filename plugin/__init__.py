@@ -105,6 +105,7 @@ _MAX_AGENT_MARKDOWN_BYTES = 3072
 _MAX_DEVICE_JSON_BYTES = 4095
 _MAX_DETAIL_BODY_BYTES = 3200
 _MAX_RETAINED_DETAIL_BYTES = 16 * 1024
+_MESSAGE_PREVIEW_CHARS = 200
 _MARKDOWN_CLIPPED_MARKER = "\n\n[Response clipped]"
 _turns: set[str] = set()                  # session_ids with an LLM call in flight
 _pending: OrderedDict[str, str] = OrderedDict()   # approval session_key -> text
@@ -198,16 +199,81 @@ def _entry_id_snapshot(offset: int = 0, count: int = 5) -> list[str]:
     return list(_entry_ids)[offset:offset + count]
 
 
+def _seed_recent_messages(db_path: Path | None = None) -> int:
+    """Seed the in-memory MSGS history from recent gateway messages, read-only.
+
+    This runs only during gateway startup. Bound both the row count and each
+    selected body before materializing the results, then use the regular entry
+    path so message IDs and retained-body limits stay consistent with live rows.
+    """
+    with _lock:
+        if _entries:
+            return 0
+
+    db_path = db_path or (Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+                          / "state.db")
+    now = time.time()
+    try:
+        con = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.5)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                """
+                SELECT m.timestamp, m.role, substr(m.content, 1, ?) AS content
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE m.timestamp >= ?
+                  AND m.role IN ('user', 'assistant')
+                  AND m.content IS NOT NULL
+                  AND length(trim(m.content)) > 0
+                  AND COALESCE(m.content, '') NOT LIKE '[IMPORTANT: You are running as a scheduled cron job.%'
+                ORDER BY m.timestamp DESC, m.id DESC
+                LIMIT 40
+                """,
+                (_MAX_RETAINED_DETAIL_BYTES + 1, now - 24 * 3600),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("familiar: unable to seed recent messages from state.db", exc_info=True)
+        return 0
+
+    seeded = 0
+    with _lock:
+        # A concurrently delivered live hook wins over the startup snapshot.
+        if _entries:
+            return 0
+        _sync_entry_ids()
+        for row in reversed(rows):
+            role = str(row["role"] or "")
+            if role not in ("user", "assistant"):
+                continue
+            try:
+                stamp = datetime.fromtimestamp(float(row["timestamp"])).strftime("%H:%M")
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+            body = str(row["content"] or "")
+            if not body.strip():
+                continue
+            preview = _actions.compact(body, _MESSAGE_PREVIEW_CHARS)
+            _append_entry(f"{stamp} {role[0]}: {preview}", body, role)
+            seeded += 1
+    return seeded
+
+
 def _fit_detail_response(frame: dict) -> dict:
     """Fit a detail response into the complete JSON line budget."""
     body, clipped = _utf8_prefix(str(frame.get("body", "")), _MAX_DETAIL_BODY_BYTES)
-    clipped = clipped or bool(frame.get("truncated"))
+    retained_truncated = bool(frame.get("retained_truncated", frame.get("truncated")))
     base = dict(frame)
 
     def candidate(chars: int) -> dict:
         out = dict(base)
         out["body"] = body[:chars]
-        out["truncated"] = clipped or chars < len(body)
+        chunk_shortened = clipped or chars < len(body)
+        out["has_more"] = bool(base.get("has_more")) or chunk_shortened
+        out["retained_truncated"] = retained_truncated
+        out["truncated"] = retained_truncated or out["has_more"]
         return out
 
     full = candidate(len(body))
@@ -226,27 +292,64 @@ def _fit_detail_response(frame: dict) -> dict:
         return best
     # IDs are internally short; this fallback protects against malformed input.
     fallback = {"type": "msg", "id": str(frame.get("id", ""))[:64], "body": "",
-                "role": str(frame.get("role", ""))[:32], "truncated": True,
+                "role": str(frame.get("role", ""))[:32], "body_offset": 0,
+                "body_total": 0, "has_more": False, "retained_truncated": False,
+                "truncated": True,
                 "error": str(frame.get("error", "oversize"))[:32]}
     return fallback
 
 
-def _send_message_detail(entry_id: str) -> None:
+def _send_message_detail(entry_id: str, offset: object = 0) -> None:
     if _link is None:
         return
     entry_id = str(entry_id or "")[:64]
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        offset = None
     with _lock:
         _sync_entry_ids()
         if entry_id not in _entry_ids:
             frame = {"type": "msg", "id": entry_id, "body": "", "role": "",
+                     "body_offset": 0 if offset is None else offset, "body_total": 0,
+                     "has_more": False, "retained_truncated": False,
                      "truncated": False, "error": "stale"}
         else:
             detail = _entry_details.get(entry_id)
             if detail is None:
                 frame = {"type": "msg", "id": entry_id, "body": "", "role": "",
+                         "body_offset": 0 if offset is None else offset, "body_total": 0,
+                         "has_more": False, "retained_truncated": False,
                          "truncated": False, "error": "unavailable"}
+            elif offset is None or offset > len(detail["body"].encode("utf-8")):
+                frame = {"type": "msg", "id": entry_id, "body": "", "role": detail["role"],
+                         "body_offset": 0 if offset is None else offset,
+                         "body_total": len(detail["body"].encode("utf-8")),
+                         "has_more": False, "retained_truncated": detail["truncated"],
+                         "truncated": detail["truncated"],
+                         "error": "offset"}
             else:
-                frame = {"type": "msg", "id": entry_id, **detail}
+                retained = detail["body"].encode("utf-8")
+                try:
+                    # The reader advances only by returned UTF-8 byte lengths;
+                    # reject arbitrary offsets that split a code point.
+                    retained[:offset].decode("utf-8")
+                except UnicodeDecodeError:
+                    frame = {"type": "msg", "id": entry_id, "body": "", "role": detail["role"],
+                             "body_offset": offset, "body_total": len(retained),
+                             "has_more": False, "retained_truncated": detail["truncated"],
+                             "truncated": detail["truncated"],
+                             "error": "offset"}
+                else:
+                    remaining = retained[offset:].decode("utf-8")
+                    chunk, _ = _utf8_prefix(remaining, _MAX_DETAIL_BODY_BYTES)
+                    chunk_bytes = chunk.encode("utf-8")
+                    next_offset = offset + len(chunk_bytes)
+                    frame = {
+                        "type": "msg", "id": entry_id, "body": chunk,
+                        "role": detail["role"], "body_offset": offset,
+                        "body_total": len(retained), "has_more": next_offset < len(retained),
+                        "retained_truncated": detail["truncated"],
+                        "truncated": detail["truncated"] or next_offset < len(retained),
+                    }
     _link.send(_fit_detail_response(frame))
 
 
@@ -344,7 +447,7 @@ def _surface_job_result() -> None:
     ok = res.get("rc", 0) == 0
     stamp = datetime.now().strftime("%H:%M")
     with _lock:
-        _append_entry(f"{stamp} >{label}: {_actions.compact(text, 70)}",
+        _append_entry(f"{stamp} >{label}: {_actions.compact(text, _MESSAGE_PREVIEW_CHARS)}",
                       str(res.get("text") or ""), "job")
     _set_msg(f"[{label}] {text}")
     _link.send({"type": "notify", "msg": f"{label}: {text}",
@@ -362,7 +465,7 @@ def _loom_tick() -> None:
     stamp = datetime.now().strftime("%H:%M")
     with _lock:
         for ev in events[:6]:
-            _append_entry(f"{stamp} L: {_actions.compact(ev['text'], 70)}",
+            _append_entry(f"{stamp} L: {_actions.compact(ev['text'], _MESSAGE_PREVIEW_CHARS)}",
                           str(ev["text"]), "loom")
     loud = [ev for ev in events if ev["speak"]]
     if len(events) > 3 and not loud:
@@ -593,7 +696,7 @@ def _on_session_end(session_id="", **kw):
 
 
 def _on_pre_llm(platform="", session_id="", user_message="", **kw):
-    um = _actions.compact(str(user_message or ""), 70)
+    um = _actions.compact(str(user_message or ""), _MESSAGE_PREVIEW_CHARS)
     with _lock:
         _turns.add(str(session_id or "?"))
         if um:
@@ -627,7 +730,7 @@ def _on_post_llm(assistant_response="", platform="", session_id="", **kw):
             markdown, _MAX_AGENT_MARKDOWN_BYTES)
         if text:
             stamp = datetime.now().strftime("%H:%M")
-            _append_entry(f"{stamp} a: {_actions.compact(text, 70)}", raw, "assistant")
+            _append_entry(f"{stamp} a: {_actions.compact(text, _MESSAGE_PREVIEW_CHARS)}", raw, "assistant")
             _msg = text if not src else f"[{src}] {text}"[:140]
         else:
             _msg = "No text response"
@@ -760,12 +863,12 @@ def _handle_device_line(evt: dict, origin: str = "usb") -> None:
             ids = list(_entry_ids)[off:off + 5]
         if _link is not None:
             frame = {"type": "msgs", "off": off, "total": total,
-                     "lines": [_actions.compact(l, 80) for l in lines],
+                     "lines": [_actions.compact(l, _MESSAGE_PREVIEW_CHARS) for l in lines],
                      "ids": ids}
             _link.send(_fit_message_previews(frame, "lines"))
         return
     if cmd == "msg":
-        _send_message_detail(str(evt.get("id") or ""))
+        _send_message_detail(str(evt.get("id") or ""), evt.get("offset", 0))
         return
     if cmd == "hello" or "hello" in evt:
         # device (re)booted — teach it where home is (for untethered TCP
@@ -793,8 +896,14 @@ def _handle_device_line(evt: dict, origin: str = "usb") -> None:
             _push(_jobs.cancel())
         return
     if cmd == "permission":
-        decision = str(evt.get("decision") or "once")
+        decision = str(evt.get("decision") or "")
         want = str(evt.get("id") or "")
+        if decision not in ("once", "deny"):
+            with _lock:
+                waiting = len(_pending)
+            _push({"type": "ack", "msg": "invalid approval decision",
+                   "waiting": waiting})
+            return
         with _lock:
             # A stale/non-empty approval id must never fall through to another
             # pending command. Only id-less legacy clients use FIFO selection.
@@ -937,7 +1046,7 @@ def _tool_notify(args=None, **kw) -> str:
     _link.send(desk_frame, leg="desk")
     _link.send(frame, leg="phone")
     with _lock:
-        _append_entry(f"{datetime.now().strftime('%H:%M')} !: {_actions.compact(msg, 70)}",
+        _append_entry(f"{datetime.now().strftime('%H:%M')} !: {_actions.compact(msg, _MESSAGE_PREVIEW_CHARS)}",
                       str(args.get("message") or ""), "notification")
     logger.info("push: notify len=%d sound=%s say=%s route=%s desk_quiet=%s",
                 len(msg), frame["sound"], frame.get("say", "-"),
@@ -991,6 +1100,7 @@ def register(ctx) -> None:
     _ctx["ctx"] = ctx
 
     if _is_gateway_process():
+        _seed_recent_messages()
         serial_cfg = cfg.get("serial") or {}
         _link = SerialLink(
             _handle_device_line,

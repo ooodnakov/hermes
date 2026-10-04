@@ -10,11 +10,7 @@
 
 namespace ui {
 namespace {
-constexpr uint16_t kBg = 0x0000, kPanel = 0x0841, kDim = 0x7BEF;
-constexpr uint16_t kGreen = 0xAFE5, kInk = 0xDFFF, kAmber = 0xFEE0, kRed = 0xF965;
-constexpr uint16_t kCyan = 0x07F5;
-constexpr const char* kTabs[] = {"FACE", "MSGS", "OPS", "FLEET", "CRON", "NET", "DEV"};
-constexpr uint16_t kDeckColors[] = {kGreen, kAmber, kRed, kCyan};
+constexpr const char* kTabs[] = {"FACE", "MSGS", "OPS", "FLEET", "CRON", "NET", "DEV", "SET"};
 constexpr int16_t kContentX = 8, kContentRight = 632;
 constexpr int16_t kApprovalTop = 130, kApprovalHeight = 36;
 
@@ -63,6 +59,193 @@ String plainText(const String& source) {
     previousNewline = false;
   }
   return result;
+}
+
+uint32_t markdownHash(const String& source) {
+  uint32_t hash = 2166136261u;
+  for (uint16_t i = 0; i < source.length(); ++i) {
+    hash ^= static_cast<uint8_t>(source[i]);
+    hash *= 16777619u;
+  }
+  return hash ^ source.length();
+}
+
+bool ensureMarkdownParsed(const String& source, markdown::Document& document,
+                          uint32_t& cachedHash, bool& ready) {
+  const uint32_t hash = markdownHash(source);
+  if (ready && hash == cachedHash) return true;
+  document.clear();
+  ready = markdown::parsePrefix(textView(source), document);
+  cachedHash = hash;
+  return ready;
+}
+
+struct MarkdownColors {
+  uint16_t background;
+  uint16_t panel;
+  uint16_t green;
+  uint16_t amber;
+  uint16_t cyan;
+};
+
+void drawMarkdownRegion(lgfx::LGFX_Sprite& sprite, const markdown::Document& document,
+                        Rect rect, float scale, uint16_t& scroll,
+                        const MarkdownColors& colors) {
+  if (rect.w <= 0 || rect.h <= 0 || scale < 1.0f) return;
+  int32_t clipX = 0, clipY = 0, clipW = 0, clipH = 0;
+  sprite.getClipRect(&clipX, &clipY, &clipW, &clipH);
+  const int32_t left = std::max<int32_t>(rect.x, clipX);
+  const int32_t top = std::max<int32_t>(rect.y, clipY);
+  const int32_t right = std::min<int32_t>(rect.x + rect.w, clipX + clipW);
+  const int32_t bottom = std::min<int32_t>(rect.y + rect.h, clipY + clipH);
+  if (right <= left || bottom <= top) return;
+  sprite.setClipRect(left, top, right - left, bottom - top);
+
+  sprite.setFont(&fonts::efontJA_12);
+  sprite.setTextWrap(false);
+  sprite.setTextSize(scale);
+  const int16_t lineHeight = static_cast<int16_t>(sprite.fontHeight()) + 1;
+  const uint16_t visibleLines = static_cast<uint16_t>(std::max<int16_t>(1, rect.h / lineHeight));
+
+  for (uint8_t pass = 0; pass < 2; ++pass) {
+    uint16_t lineNumber = 0;
+    bool hasBlock = false;
+    bool atLineStart = true;
+    bool currentCodeBlock = false;
+    uint8_t currentHeadingLevel = 0;
+    int16_t indentX = rect.x;
+    int16_t cursorX = rect.x;
+    int16_t runX = rect.x;
+    int16_t runWidth = 0;
+    uint16_t runLine = 0;
+    uint8_t runStyle = markdown::Plain;
+    bool runActive = false;
+    String run;
+
+    auto lineVisible = [&](uint16_t number) {
+      return number >= scroll && number < scroll + visibleLines;
+    };
+    auto lineY = [&](uint16_t number) {
+      return static_cast<int16_t>(rect.y + (number - scroll) * lineHeight);
+    };
+    auto fontFor = [](uint8_t style) -> const lgfx::IFont* {
+      const bool bold = (style & markdown::Bold) != 0;
+      const bool italic = (style & markdown::Italic) != 0;
+      if (bold && italic) return &fonts::efontJA_12_bi;
+      if (bold) return &fonts::efontJA_12_b;
+      if (italic) return &fonts::efontJA_12_i;
+      return &fonts::efontJA_12;
+    };
+    auto flushRun = [&]() {
+      if (!runActive || pass == 0 || !lineVisible(runLine)) {
+        run = ""; runActive = false; runWidth = 0;
+        return;
+      }
+      const int16_t y = lineY(runLine);
+      const bool inlineCode = (runStyle & markdown::InlineCode) != 0;
+      const bool link = (runStyle & markdown::Link) != 0;
+      uint16_t foreground = currentCodeBlock || inlineCode ? colors.cyan : colors.green;
+      if (link) foreground = colors.cyan;
+      if (currentHeadingLevel && !inlineCode && !currentCodeBlock) foreground = colors.amber;
+      if (inlineCode && !currentCodeBlock)
+        sprite.fillRoundRect(runX, y, runWidth, lineHeight, 2, colors.panel);
+      sprite.setFont(fontFor(runStyle | (currentHeadingLevel ? markdown::Bold : markdown::Plain)));
+      sprite.setTextWrap(false);
+      sprite.setTextSize(scale);
+      const uint16_t background = inlineCode || currentCodeBlock ? colors.panel : colors.background;
+      emoji_text::draw(sprite, textView(run), runX, y, foreground, background, scale);
+      if (link) sprite.drawFastHLine(runX, y + lineHeight - 2, runWidth, colors.cyan);
+      run = ""; runActive = false; runWidth = 0;
+    };
+    auto beginLine = [&]() {
+      cursorX = indentX;
+      atLineStart = true;
+      if (pass == 1 && currentCodeBlock && lineVisible(lineNumber))
+        sprite.fillRoundRect(rect.x, lineY(lineNumber), rect.w, lineHeight, 2, colors.panel);
+    };
+    auto nextLine = [&]() {
+      flushRun();
+      ++lineNumber;
+      beginLine();
+    };
+
+    for (const markdown::Block& block : document.blocks) {
+      if (block.kind == markdown::BlockKind::Blank || block.spanCount == 0) continue;
+      if (hasBlock && !atLineStart) {
+        flushRun();
+        ++lineNumber;
+        cursorX = rect.x;
+        atLineStart = true;
+      }
+      currentCodeBlock = block.kind == markdown::BlockKind::CodeBlock;
+      currentHeadingLevel = block.kind == markdown::BlockKind::Heading ? block.headingLevel : 0;
+      indentX = rect.x;
+      if (block.kind == markdown::BlockKind::BulletItem ||
+          block.kind == markdown::BlockKind::OrderedItem) {
+        char marker[16];
+        if (block.kind == markdown::BlockKind::OrderedItem)
+          snprintf(marker, sizeof(marker), "%u. ", block.listNumber);
+        else snprintf(marker, sizeof(marker), "- ");
+        const String prefix(marker);
+        sprite.setFont(&fonts::efontJA_12_b);
+        sprite.setTextSize(scale);
+        const int16_t prefixWidth = static_cast<int16_t>(sprite.textWidth(prefix));
+        if (pass == 1 && lineVisible(lineNumber)) {
+          const int16_t y = lineY(lineNumber);
+          sprite.setTextColor(colors.amber, colors.background);
+          sprite.setCursor(rect.x, y);
+          sprite.print(prefix);
+        }
+        indentX = static_cast<int16_t>(rect.x + prefixWidth);
+      }
+      beginLine();
+
+      for (uint16_t spanIndex = block.firstSpan;
+           spanIndex < block.firstSpan + block.spanCount; ++spanIndex) {
+        const markdown::Span& span = document.spans[spanIndex];
+        const std::string_view spanText(document.text.data() + span.textBegin, span.textLength);
+        for (size_t offset = 0; offset < spanText.size();) {
+          size_t tokenOffset = offset;
+          emoji_text::Token token;
+          if (!emoji_text::nextToken(spanText, tokenOffset, token)) break;
+          const size_t next = token.end;
+          const std::string glyphBytes(spanText.substr(offset, next - offset));
+          const String glyph(glyphBytes.c_str());
+          offset = next;
+          if (glyph == "\n") { nextLine(); continue; }
+          if (atLineStart && glyph == " " && !currentCodeBlock) continue;
+          const uint8_t style = static_cast<uint8_t>(span.style |
+              (currentHeadingLevel ? markdown::Bold : markdown::Plain));
+          sprite.setFont(fontFor(style));
+          sprite.setTextSize(scale);
+          const int16_t glyphWidth = emoji_text::tokenWidth(sprite, spanText, token, scale);
+          if (cursorX + glyphWidth > rect.x + rect.w && cursorX > indentX) nextLine();
+          if (atLineStart && glyph == " " && !currentCodeBlock) continue;
+          if (!runActive || runStyle != span.style || runLine != lineNumber ||
+              runX + runWidth != cursorX) {
+            flushRun();
+            runX = cursorX;
+            runLine = lineNumber;
+            runStyle = span.style;
+            runActive = true;
+          }
+          run += glyph;
+          runWidth = static_cast<int16_t>(runWidth + glyphWidth);
+          cursorX = static_cast<int16_t>(cursorX + glyphWidth);
+          atLineStart = false;
+        }
+      }
+      flushRun();
+      hasBlock = true;
+    }
+    flushRun();
+    const uint16_t totalLines = hasBlock ? static_cast<uint16_t>(lineNumber + 1) : 0;
+    if (pass == 0) {
+      const uint16_t maxScroll = totalLines > visibleLines ? totalLines - visibleLines : 0;
+      if (scroll > maxScroll) scroll = maxScroll;
+    }
+  }
+  sprite.setClipRect(clipX, clipY, clipW, clipH);
 }
 
 uint16_t countWrappedLines(lgfx::LGFX_Sprite& sprite, const String& source,
@@ -176,9 +359,10 @@ void FamiliarUi::setFacePainter(FacePainter painter, void* context) {
 }
 
 Rect FamiliarUi::tabRect(uint8_t index) {
-  if (index >= 7) return {0, 0, 0, 0};
-  const int16_t left = (int32_t)index * kWidth / 7;
-  const int16_t right = (int32_t)(index + 1) * kWidth / 7;
+  constexpr uint8_t kTabCount = static_cast<uint8_t>(protocol::Page::Count);
+  if (index >= kTabCount) return {0, 0, 0, 0};
+  const int16_t left = (int32_t)index * kWidth / kTabCount;
+  const int16_t right = (int32_t)(index + 1) * kWidth / kTabCount;
   return {left, 0, static_cast<int16_t>(right - left), kTabHeight};
 }
 
@@ -199,6 +383,21 @@ Rect FamiliarUi::artRect() { return {0, kTabHeight, 144, 144}; }
 Rect FamiliarUi::messageCardRect(uint8_t index) {
   if (index >= 2) return {0, 0, 0, 0};
   return {8, static_cast<int16_t>(49 + index * 58), 624, 55};
+}
+Rect FamiliarUi::settingsThemeRect(uint8_t index) {
+  if (index >= themes::count()) return {0, 0, 0, 0};
+  constexpr int16_t margin = 8, gap = 8;
+  const int16_t count = static_cast<int16_t>(themes::count());
+  const int16_t width = static_cast<int16_t>(
+      (kWidth - 2 * margin - (count - 1) * gap) / count);
+  return {static_cast<int16_t>(margin + index * (width + gap)), 45, width, 37};
+}
+Rect FamiliarUi::settingsSoundRect() { return {8, 91, 304, 34}; }
+Rect FamiliarUi::settingsAnimationRect() { return {328, 91, 304, 34}; }
+Rect FamiliarUi::settingsBrightnessRect(uint8_t index) {
+  if (index >= 4) return {0, 0, 0, 0};
+  constexpr int16_t start = 130, width = 122, gap = 4;
+  return {static_cast<int16_t>(start + index * (width + gap)), 136, width, 28};
 }
 
 void FamiliarUi::emit(const String& json) {
@@ -223,10 +422,23 @@ void FamiliarUi::tick(uint32_t nowMs) {
     state_.messageDetailError = "timeout";
     state_.dirty = true;
   }
+  if (messageDetailModal_ && state_.modalActive && state_.messageDetailHasMore &&
+      !state_.messageDetailPending && !state_.messageDetailError.length()) {
+    requestMessageDetail(state_.messageDetailNextOffset);
+  }
 }
 
 void FamiliarUi::render(uint32_t nowMs) {
   tick(nowMs);
+  const themes::Palette& palette = themes::get(state_.themeId);
+  kBg = palette.background;
+  kPanel = palette.panel;
+  kDim = palette.secondary;
+  kGreen = palette.accent;
+  kInk = palette.text;
+  kAmber = palette.warning;
+  kRed = palette.danger;
+  kCyan = palette.code;
   // Face painters and the reusable sprite can leave global text state behind.
   // Set a known UTF-8 font and disable implicit edge wrapping every frame.
   sprite_.setFont(&fonts::efontJA_12);
@@ -253,7 +465,7 @@ void FamiliarUi::render(uint32_t nowMs) {
 }
 
 void FamiliarUi::drawTabs(uint16_t accent) {
-  for (uint8_t i = 0; i < 7; ++i) {
+  for (uint8_t i = 0; i < static_cast<uint8_t>(protocol::Page::Count); ++i) {
     const Rect r = tabRect(i);
     const bool selected = pageIndex(state_.page) == i;
     sprite_.fillRect(r.x, r.y, r.w, r.h, selected ? kPanel : kBg);
@@ -289,6 +501,7 @@ void FamiliarUi::drawPage() {
       }
       break;
     }
+    case protocol::Page::Settings: drawSettings(); break;
     default: break;
   }
 }
@@ -318,7 +531,14 @@ void FamiliarUi::drawFace() {
   drawText(String(state_.tokensToday), 222, 81, 180, kInk, 1.0f);
   sprite_.drawFastHLine(164, 94, 468, kDim);
   drawText("LATEST", 164, 98, 468, kDim, 1.0f, false);
-  drawWrapped(state_.message, 164, 113, 468, 52, kGreen);
+  auto& preview = facePreviewCache_;
+  if (ensureMarkdownParsed(state_.message, preview.document, preview.hash, preview.ready)) {
+    uint16_t scroll = 0;
+    drawMarkdownRegion(sprite_, preview.document, {164, 113, 468, 52}, 1.0f,
+                       scroll, {kBg, kPanel, kGreen, kAmber, kCyan});
+  } else {
+    drawWrapped(plainText(state_.message), 164, 113, 468, 52, kGreen);
+  }
   drawText(live ? state_.linkStatus : "OFFLINE", 510, 31, 122, live ? kGreen : kDim, 1.0f);
 }
 
@@ -364,11 +584,20 @@ void FamiliarUi::drawMessages() {
     const bool selected = card == 0;
     sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 5, selected ? kGreen : kPanel);
     drawText(parts.sender + (parts.time.length() ? "  " + parts.time : ""),
-             r.x + 8, r.y + 4, r.w - 104, kDim, 0.9f, false);
+             r.x + 8, r.y + 4, r.w - 104, kDim, 1.0f, false);
     drawText("OPEN >", r.x + r.w - 72, r.y + 4, 62, selected ? kGreen : kDim,
-             0.9f, false);
-    drawWrapped(parts.preview, r.x + 8, r.y + 19, r.w - 16, r.h - 21,
-                selected ? kInk : kGreen, 1.1f);
+             1.0f, false);
+    auto& preview = messagePreviewCaches_[card];
+    if (ensureMarkdownParsed(parts.preview, preview.document, preview.hash, preview.ready)) {
+      uint16_t scroll = 0;
+      drawMarkdownRegion(sprite_, preview.document,
+                         {static_cast<int16_t>(r.x + 8), static_cast<int16_t>(r.y + 19),
+                          static_cast<int16_t>(r.w - 16), static_cast<int16_t>(r.h - 20)},
+                         1.0f, scroll, {kBg, kPanel, selected ? kInk : kGreen, kAmber, kCyan});
+    } else {
+      drawWrapped(plainText(parts.preview), r.x + 8, r.y + 19, r.w - 16, r.h - 20,
+                  selected ? kInk : kGreen, 1.0f);
+    }
   }
   if (!count) {
     drawText("no messages yet", kContentX, 68, kContentRight - 2 * kContentX, kDim);
@@ -397,7 +626,8 @@ void FamiliarUi::drawOperations() {
   }
   for (uint8_t i = 0; i < state_.deckCount; ++i) {
     const Rect r = deckRect(i);
-    const uint16_t color = kDeckColors[state_.deck[i].color & 3];
+    const uint16_t deckColors[] = {kGreen, kAmber, kRed, kCyan};
+    const uint16_t color = deckColors[state_.deck[i].color & 3];
     const bool running = state_.runningDeck == i;
     const bool armed = state_.armedDeck == i && static_cast<int32_t>(nowMs_ - state_.armedUntilMs) < 0;
     if (running) sprite_.fillRoundRect(r.x, r.y, r.w, r.h, 5, color);
@@ -408,6 +638,41 @@ void FamiliarUi::drawOperations() {
     drawCenteredText(running ? "STOP" : state_.deck[i].confirm && !armed ? "2TAP" : "",
                      {static_cast<int16_t>(r.x + r.w - 52), static_cast<int16_t>(r.y + 31), 44, 16},
                      running ? kBg : kDim, 0.85f, running ? color : kBg);
+  }
+}
+
+void FamiliarUi::drawSettings() {
+  drawText("SETTINGS", kContentX, 27, kContentRight - kContentX, kInk, 1.2f, false);
+  for (uint8_t i = 0; i < themes::count(); ++i) {
+    const Rect r = settingsThemeRect(i);
+    const bool selected = state_.themeId == i;
+    const themes::Palette& colors = themes::get(i);
+    sprite_.fillRoundRect(r.x, r.y, r.w, r.h, 4, colors.background);
+    sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 4, selected ? colors.accent : colors.secondary);
+    drawCenteredText(colors.name, {r.x, static_cast<int16_t>(r.y + 2), r.w, 17},
+                     colors.text, 1.0f, colors.background);
+    drawCenteredText(selected ? "ACTIVE" : "PREVIEW",
+                     {r.x, static_cast<int16_t>(r.y + 18), r.w, 14},
+                     colors.text,
+                     1.0f, colors.background);
+  }
+
+  const Rect sound = settingsSoundRect(), animation = settingsAnimationRect();
+  const uint16_t soundColor = state_.soundMuted ? kAmber : kGreen;
+  const uint16_t animationColor = state_.animationEnabled ? kGreen : kAmber;
+  sprite_.drawRoundRect(sound.x, sound.y, sound.w, sound.h, 4, soundColor);
+  sprite_.drawRoundRect(animation.x, animation.y, animation.w, animation.h, 4, animationColor);
+  drawCenteredText(state_.soundMuted ? "SOUND  MUTED" : "SOUND  ON", sound, kInk, 1.0f);
+  drawCenteredText(state_.animationEnabled ? "ANIMATION  ON" : "ANIMATION  PAUSED",
+                   animation, kInk, 1.0f);
+
+  drawText("BRIGHTNESS", 8, 143, 114, kDim, 1.0f, false);
+  constexpr uint8_t levels[] = {25, 50, 75, 100};
+  for (uint8_t i = 0; i < 4; ++i) {
+    const Rect r = settingsBrightnessRect(i);
+    const bool selected = state_.brightnessPercent == levels[i];
+    sprite_.drawRoundRect(r.x, r.y, r.w, r.h, 4, selected ? kGreen : kDim);
+    drawCenteredText(String(levels[i]) + "%", r, kInk, 1.0f);
   }
 }
 
@@ -424,7 +689,7 @@ void FamiliarUi::drawHostPage(const protocol::HostPage& page, const char* fallba
     sprite_.setTextColor(kGreen, kBg);
     drawWrapped(page.lines[i], rows[i].x, rows[i].y, rows[i].w, rows[i].h - 2, kGreen);
   }
-  drawText("tap a line to read full text", 8, 159, 624, kDim, 0.9f, false);
+  drawText("tap a line to read full text", 8, 159, 624, kDim, 1.0f, false);
 }
 
 void FamiliarUi::drawModal() {
@@ -432,19 +697,30 @@ void FamiliarUi::drawModal() {
            8, 27, 624, kInk, 1.2f);
   sprite_.drawFastHLine(8, 46, 624, kDim);
   if (modalContent().length()) {
-    if (agentResponseModal_) drawMarkdownResponse();
+    if (agentResponseModal_ || messageDetailModal_) drawMarkdownResponse();
     else drawWrapped(modalContent(), 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
-    const char* footer = agentResponseModal_ && agentResponseModalTruncated_
+    const char* footer = agentResponseModal_ &&
+            (agentResponseModalTruncated_ || responseDocument_.truncated)
         ? "response shortened - swipe up/down, tap to return"
         : messageDetailModal_ && state_.messageDetailPending
-            ? "loading full message - swipe up/down, tap to return"
+            ? (state_.messageDetailBody.length()
+                   ? "loading more message - swipe up/down, tap to return"
+                   : "loading full message - swipe up/down, tap to return")
         : messageDetailModal_ && state_.messageDetailError.length()
-            ? "full text unavailable - showing preview"
+            ? (state_.messageDetailError == "preview-only"
+                   ? "preview only - full text unavailable"
+                   : state_.messageDetailBody.length()
+                       ? "message incomplete - showing partial text"
+                       : "full text unavailable - showing preview")
         : messageDetailModal_ && state_.messageDetailTruncated
             ? "available text shortened - swipe up/down, tap to return"
+        : messageDetailModal_ && messageDetailSimplified_
+            ? "simplified formatting - swipe up/down, tap to return"
+        : !messageDetailModal_ && (agentResponseModalTruncated_ || responseDocument_.truncated)
+            ? "response shortened - swipe up/down, tap to return"
             : "swipe up/down to read - tap to return";
     drawText(footer,
-             8, 159, 624, kDim, 0.9f, false);
+             8, 159, 624, kDim, 1.0f, false);
   } else {
     sprite_.setFont(&fonts::efontJA_12);
     sprite_.setTextWrap(false);
@@ -468,182 +744,43 @@ void FamiliarUi::drawModal() {
       drawWrapped(state_.modal.lines[i], 8, top, 624, height, kGreen);
       top = static_cast<int16_t>(top + height + 2);
     }
-    drawText("tap to return", 8, 159, 624, kDim, 0.9f, false);
+    drawText("tap to return", 8, 159, 624, kDim, 1.0f, false);
   }
 }
 
 void FamiliarUi::ensureResponseParsed() {
+  const String& source = modalContent();
   uint32_t hash = 2166136261u;
-  for (uint16_t i = 0; i < state_.modalBody.length(); ++i) {
-    hash ^= static_cast<uint8_t>(state_.modalBody[i]);
+  for (uint16_t i = 0; i < source.length(); ++i) {
+    hash ^= static_cast<uint8_t>(source[i]);
     hash *= 16777619u;
   }
-  hash ^= state_.modalBody.length();
+  hash ^= source.length();
   if (responseParseReady_ && hash == parsedResponseHash_) return;
   responseDocument_.clear();
-  responseParseReady_ = markdown::parse(
-      std::string_view(state_.modalBody.c_str(), state_.modalBody.length()),
-      responseDocument_);
+  responseParseReady_ = markdown::parsePrefix(textView(source), responseDocument_);
+  messageDetailSimplified_ = messageDetailModal_ &&
+      (responseDocument_.truncated || !responseParseReady_) &&
+      source.length() <= markdown::kMaxSourceBytes;
   parsedResponseHash_ = hash;
 }
 
 void FamiliarUi::drawMarkdownResponse() {
   ensureResponseParsed();
   if (!responseParseReady_) {
-    drawWrapped(state_.modalBody, 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
+    drawWrapped(modalContent(), 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
     return;
   }
-  constexpr int16_t kX = 8, kY = 51, kWidth = 624, kHeight = 101;
-  sprite_.setFont(&fonts::efontJA_12);
-  sprite_.setTextWrap(false);
-  sprite_.setTextSize(1.0f);
-  const int16_t lineHeight = static_cast<int16_t>(sprite_.fontHeight()) + 1;
-  const uint16_t visibleLines = static_cast<uint16_t>(std::max<int16_t>(1, kHeight / lineHeight));
-
-  for (uint8_t pass = 0; pass < 2; ++pass) {
-    uint16_t lineNumber = 0;
-    uint16_t totalLines = 0;
-    bool hasBlock = false;
-    bool atLineStart = true;
-    bool currentCodeBlock = false;
-    uint8_t currentHeadingLevel = 0;
-    int16_t indentX = kX;
-    int16_t cursorX = kX;
-    int16_t runX = kX;
-    int16_t runWidth = 0;
-    uint16_t runLine = 0;
-    uint8_t runStyle = markdown::Plain;
-    bool runActive = false;
-    String run;
-
-    auto lineVisible = [&](uint16_t number) {
-      return number >= modalScroll_ && number < modalScroll_ + visibleLines;
-    };
-    auto lineY = [&](uint16_t number) {
-      return static_cast<int16_t>(kY + (number - modalScroll_) * lineHeight);
-    };
-    auto fontFor = [](uint8_t style) -> const lgfx::IFont* {
-      const bool bold = (style & markdown::Bold) != 0;
-      const bool italic = (style & markdown::Italic) != 0;
-      if (bold && italic) return &fonts::efontJA_12_bi;
-      if (bold) return &fonts::efontJA_12_b;
-      if (italic) return &fonts::efontJA_12_i;
-      return &fonts::efontJA_12;
-    };
-    auto flushRun = [&]() {
-      if (!runActive || pass == 0 || !lineVisible(runLine)) {
-        run = ""; runActive = false; runWidth = 0;
-        return;
-      }
-      const int16_t y = lineY(runLine);
-      const bool inlineCode = (runStyle & markdown::InlineCode) != 0;
-      const bool link = (runStyle & markdown::Link) != 0;
-      uint16_t foreground = currentCodeBlock || inlineCode ? kCyan : kGreen;
-      if (link) foreground = kCyan;
-      if (currentHeadingLevel) foreground = kAmber;
-      if (inlineCode && !currentCodeBlock)
-        sprite_.fillRoundRect(runX, y, runWidth, lineHeight, 2, kPanel);
-      sprite_.setFont(fontFor(runStyle | (currentHeadingLevel ? markdown::Bold : markdown::Plain)));
-      sprite_.setTextWrap(false);
-      sprite_.setTextSize(1.0f);
-      const uint16_t background = inlineCode || currentCodeBlock ? kPanel : kBg;
-      emoji_text::draw(sprite_, textView(run), runX, y, foreground, background);
-      if (link) sprite_.drawFastHLine(runX, y + lineHeight - 2, runWidth, kCyan);
-      run = ""; runActive = false; runWidth = 0;
-    };
-    auto beginLine = [&]() {
-      cursorX = indentX;
-      atLineStart = true;
-      if (pass == 1 && currentCodeBlock && lineVisible(lineNumber))
-        sprite_.fillRoundRect(kX, lineY(lineNumber), kWidth, lineHeight, 2, kPanel);
-    };
-    auto nextLine = [&]() {
-      flushRun();
-      ++lineNumber;
-      beginLine();
-    };
-
-    for (const markdown::Block& block : responseDocument_.blocks) {
-      if (block.kind == markdown::BlockKind::Blank || block.spanCount == 0) continue;
-      if (hasBlock && !atLineStart) {
-        flushRun();
-        ++lineNumber;
-        cursorX = kX;
-        atLineStart = true;
-      }
-      currentCodeBlock = block.kind == markdown::BlockKind::CodeBlock;
-      currentHeadingLevel = block.kind == markdown::BlockKind::Heading ? block.headingLevel : 0;
-      indentX = kX;
-      if (block.kind == markdown::BlockKind::BulletItem ||
-          block.kind == markdown::BlockKind::OrderedItem) {
-        char marker[16];
-        if (block.kind == markdown::BlockKind::OrderedItem)
-          snprintf(marker, sizeof(marker), "%u. ", block.listNumber);
-        else snprintf(marker, sizeof(marker), "- ");
-        const String prefix(marker);
-        sprite_.setFont(&fonts::efontJA_12_b);
-        sprite_.setTextSize(1.0f);
-        const int16_t prefixWidth = static_cast<int16_t>(sprite_.textWidth(prefix));
-        if (pass == 1 && lineVisible(lineNumber)) {
-          const int16_t y = lineY(lineNumber);
-          sprite_.setTextColor(kAmber, kBg);
-          sprite_.setCursor(kX, y);
-          sprite_.print(prefix);
-        }
-        indentX = static_cast<int16_t>(kX + prefixWidth);
-      }
-      beginLine();
-
-      for (uint16_t spanIndex = block.firstSpan;
-           spanIndex < block.firstSpan + block.spanCount; ++spanIndex) {
-        const markdown::Span& span = responseDocument_.spans[spanIndex];
-        const std::string_view spanText(responseDocument_.text.data() + span.textBegin,
-                                        span.textLength);
-        for (size_t offset = 0; offset < spanText.size();) {
-          size_t tokenOffset = offset;
-          emoji_text::Token token;
-          if (!emoji_text::nextToken(spanText, tokenOffset, token)) break;
-          const size_t next = token.end;
-          const std::string glyphBytes(spanText.substr(offset, next - offset));
-          const String glyph(glyphBytes.c_str());
-          offset = next;
-          if (glyph == "\n") { nextLine(); continue; }
-          if (atLineStart && glyph == " " && !currentCodeBlock) continue;
-          const uint8_t style = static_cast<uint8_t>(span.style |
-              (currentHeadingLevel ? markdown::Bold : markdown::Plain));
-          sprite_.setFont(fontFor(style));
-          sprite_.setTextSize(1.0f);
-          const int16_t glyphWidth = emoji_text::tokenWidth(sprite_, spanText, token);
-          if (cursorX + glyphWidth > kX + kWidth && cursorX > indentX) nextLine();
-          if (atLineStart && glyph == " " && !currentCodeBlock) continue;
-          if (!runActive || runStyle != span.style || runLine != lineNumber ||
-              runX + runWidth != cursorX) {
-            flushRun();
-            runX = cursorX;
-            runLine = lineNumber;
-            runStyle = span.style;
-            runActive = true;
-          }
-          run += glyph;
-          runWidth = static_cast<int16_t>(runWidth + glyphWidth);
-          cursorX = static_cast<int16_t>(cursorX + glyphWidth);
-          atLineStart = false;
-        }
-      }
-      flushRun();
-      hasBlock = true;
-    }
-    flushRun();
-    totalLines = hasBlock ? static_cast<uint16_t>(lineNumber + 1) : 0;
-    if (pass == 0) {
-      const uint16_t maxScroll = totalLines > visibleLines ? totalLines - visibleLines : 0;
-      if (modalScroll_ > maxScroll) modalScroll_ = maxScroll;
-    }
+  if (messageDetailModal_ && messageDetailSimplified_) {
+    drawWrapped(modalContent(), 8, 51, 624, 101, kGreen, 1.0f, modalScroll_);
+    return;
   }
+  drawMarkdownRegion(sprite_, responseDocument_, {8, 51, 624, 101}, 1.0f,
+                     modalScroll_, {kBg, kPanel, kGreen, kAmber, kCyan});
 }
 
 void FamiliarUi::drawText(const String& source, int16_t x, int16_t y, int16_t width,
-                          uint16_t color, float size, bool ellipsis, uint16_t background) {
+                          uint16_t color, float size, bool ellipsis, uint32_t background) {
   if (width <= 0) return;
   const String text = plainText(source);
   sprite_.setFont(&fonts::efontJA_12);
@@ -674,11 +811,13 @@ void FamiliarUi::drawText(const String& source, int16_t x, int16_t y, int16_t wi
     }
     if (useSuffix) fitted += suffix;
   }
-  emoji_text::draw(sprite_, textView(fitted), x, y, color, background, size);
+  const uint16_t resolvedBackground = background == UINT32_MAX
+      ? kBg : static_cast<uint16_t>(background);
+  emoji_text::draw(sprite_, textView(fitted), x, y, color, resolvedBackground, size);
 }
 
 void FamiliarUi::drawCenteredText(const String& source, const Rect& rect,
-                                  uint16_t color, float size, uint16_t background) {
+                                  uint16_t color, float size, uint32_t background) {
   const String text = plainText(source);
   sprite_.setFont(&fonts::efontJA_12);
   sprite_.setTextWrap(false);
@@ -764,7 +903,7 @@ void FamiliarUi::drawWrapped(const String& source, int16_t x, int16_t y, int16_t
 }
 
 void FamiliarUi::selectPage(uint8_t index) {
-  if (index >= 7) return;
+  if (index >= static_cast<uint8_t>(protocol::Page::Count)) return;
   state_.page = static_cast<protocol::Page>(index);
   state_.modalActive = false;
   state_.modalBody = "";
@@ -797,9 +936,23 @@ void FamiliarUi::decideApproval(const char* decision) {
 }
 
 const String& FamiliarUi::modalContent() const {
-  if (messageDetailModal_ && !state_.messageDetailPending &&
-      state_.messageDetailBody.length()) return state_.messageDetailBody;
+  if (messageDetailModal_ && state_.messageDetailBody.length()) return state_.messageDetailBody;
   return state_.modalBody;
+}
+
+void FamiliarUi::requestMessageDetail(uint32_t offset) {
+  if (!messageDetailModal_ || !state_.modalActive ||
+      state_.messageDetailRequestedId.isEmpty()) return;
+  JsonDocument document;
+  document["cmd"] = "msg";
+  document["id"] = state_.messageDetailRequestedId;
+  document["offset"] = offset;
+  String request;
+  serializeJson(document, request);
+  state_.messageDetailRequestedOffset = offset;
+  state_.messageDetailPending = true;
+  messageDetailRequestedAtMs_ = nowMs_;
+  emit(request);
 }
 
 void FamiliarUi::openAgentResponseModal() {
@@ -826,22 +979,23 @@ void FamiliarUi::openMessage(uint8_t index, bool history) {
   state_.modalActive = true;
   agentResponseModal_ = false;
   agentResponseModalTruncated_ = false;
-  messageDetailModal_ = id.length() > 0;
+  messageDetailModal_ = true;
   state_.messageDetailRequestedId = id;
   state_.messageDetailPending = id.length() > 0;
   state_.messageDetailBody = "";
   state_.messageDetailRole = parts.sender;
-  state_.messageDetailError = "";
+  state_.messageDetailError = id.length() ? "" : "preview-only";
   state_.messageDetailTruncated = false;
+  state_.messageDetailHasMore = false;
+  state_.messageDetailRequestedOffset = 0;
+  state_.messageDetailNextOffset = 0;
+  state_.messageDetailTotalBytes = 0;
+  messageDetailSimplified_ = false;
+  responseParseReady_ = false;
   messageDetailRequestedAtMs_ = nowMs_;
   modalScroll_ = 0;
   if (id.length()) {
-    JsonDocument document;
-    document["cmd"] = "msg";
-    document["id"] = id;
-    String request;
-    serializeJson(document, request);
-    emit(request);
+    requestMessageDetail(0);
   }
 }
 
@@ -915,7 +1069,36 @@ void FamiliarUi::handleTap(int16_t x, int16_t y) {
     state_.dirty = true;
     return;
   }
-  for (uint8_t i = 0; i < 7; ++i) if (tabRect(i).contains(x, y)) { selectPage(i); return; }
+  for (uint8_t i = 0; i < static_cast<uint8_t>(protocol::Page::Count); ++i)
+    if (tabRect(i).contains(x, y)) { selectPage(i); return; }
+  if (state_.page == protocol::Page::Settings) {
+    uint8_t chosenTheme = UINT8_MAX;
+    for (uint8_t i = 0; i < themes::count(); ++i)
+      if (settingsThemeRect(i).contains(x, y)) { chosenTheme = i; break; }
+    if (chosenTheme != UINT8_MAX && state_.themeId != chosenTheme) {
+      state_.themeId = chosenTheme;
+      state_.uiSettingsDirty = true;
+      state_.dirty = true;
+    } else if (settingsSoundRect().contains(x, y)) {
+      state_.soundMuted = !state_.soundMuted;
+      state_.uiSettingsDirty = true;
+      state_.dirty = true;
+    } else if (settingsAnimationRect().contains(x, y)) {
+      state_.animationEnabled = !state_.animationEnabled;
+      state_.uiSettingsDirty = true;
+      state_.dirty = true;
+    } else {
+      constexpr uint8_t levels[] = {25, 50, 75, 100};
+      for (uint8_t i = 0; i < 4; ++i) {
+        if (!settingsBrightnessRect(i).contains(x, y) || state_.brightnessPercent == levels[i]) continue;
+        state_.brightnessPercent = levels[i];
+        state_.uiSettingsDirty = true;
+        state_.dirty = true;
+        break;
+      }
+    }
+    return;
+  }
   if (state_.page == protocol::Page::Operations) {
     if (state_.approval.active || state_.waiting > 0) {
       // Exact regions alone resolve an approval. Its text, title, border,
@@ -1021,7 +1204,8 @@ void FamiliarUi::touchGesture(int16_t sx, int16_t sy, int16_t ex, int16_t ey,
   const bool horizontal = abs(dx) >= 45 && abs(dy) <= 55;
   const bool vertical = abs(dy) >= 45 && abs(dx) <= 55;
   if (horizontal) {
-    int next = (static_cast<int>(state_.page) + (dx < 0 ? 1 : 6)) % 7;
+    const int pageCount = static_cast<int>(protocol::Page::Count);
+    int next = (static_cast<int>(state_.page) + (dx < 0 ? 1 : pageCount - 1)) % pageCount;
     selectPage(next);
     state_.message = dx < 0 ? "swipe: next" : "swipe: prev";
     emit(String("{\"cmd\":\"swipe\",\"dx\":") + dx + ",\"dy\":" + dy + "}");

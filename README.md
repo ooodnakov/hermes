@@ -1,12 +1,40 @@
-# Hermes Familiar for Waveshare ESP32-S3-Touch-LCD-2.8
+# Hermes Familiar
 
-A physical Hermes Agent familiar: green-phosphor portrait, SD-card animations, touch controls, and a native Hermes gateway plugin that drives it live over USB — agent state, tool activity, approvals, and device-started actions.
+A physical Hermes Agent familiar with animated artwork, touch controls, and a
+native gateway plugin for agent state, messages, approvals, and device-started
+actions. The current development and release target is the Waveshare
+ESP32-S3-Touch-LCD-3.49 V1. The original 2.8-inch profile remains available as
+a separate legacy build.
+
+## Board profiles
+
+| Board | PlatformIO environment | Display | Release guide |
+| --- | --- | --- | --- |
+| Waveshare ESP32-S3-Touch-LCD-3.49 V1 (current) | `waveshare_esp32_s3_touch_lcd_349_v1` | 640 × 172 landscape | [`docs/RELEASE_349_V1.md`](docs/RELEASE_349_V1.md) |
+| Waveshare ESP32-S3-Touch-LCD-2.8 (legacy) | `waveshare_esp32_s3_touch_lcd_28` | 240 × 320 portrait | This repository's original 2.8 instructions below |
+
+Build a named profile explicitly. Bare `pio run` builds all configured
+environments, so select the desired board with `-e` when producing an image.
+
+```sh
+pio run -e waveshare_esp32_s3_touch_lcd_349_v1
+pio run -e waveshare_esp32_s3_touch_lcd_28
+```
+
+The V1 release artifacts, SD card layout, checksums, build metadata, pin map,
+serial setup, and recovery notes are in [`docs/RELEASE_349_V1.md`](docs/RELEASE_349_V1.md).
+The latest bring-up evidence and accepted limitations are in
+[`docs/HANDOFF_WAVESHARE_349_V1.md`](docs/HANDOFF_WAVESHARE_349_V1.md).
+
+## Legacy 2.8 profile
+
+The following original board, feature, build, and plugin notes describe the
+Waveshare ESP32-S3-Touch-LCD-2.8 profile unless a section explicitly says V1.
 
 ## Verified hardware
 
 - Board: Waveshare ESP32-S3-Touch-LCD-2.8
-- USB serial: `/dev/cu.usbmodem101`
-- ESP32-S3 MAC seen during flash: `28:37:2f:88:dc:3c`
+- USB serial: identify the connected board's port on your host before flashing.
 - Display: ST7789, 240x320
 - Touch: CST328 over I2C, verified with vendor `0xCACA` check
   - SDA GPIO1, SCL GPIO3, INT GPIO4, RST GPIO2, addr `0x1A`
@@ -59,23 +87,19 @@ board-specific upload notes.
 ## Flash
 
 ```bash
-pio run -t upload --upload-port /dev/cu.usbmodem101
+pio run -e waveshare_esp32_s3_touch_lcd_28 -t upload --upload-port <PORT>
 ```
 
 Monitor boot:
 
 ```bash
-pio device monitor -p /dev/cu.usbmodem101 -b 115200
+pio device monitor -p <PORT> -b 115200
 ```
 
-Expected boot lines:
+Expected legacy 2.8 boot lines:
 
 ```json
 {"touch":"ok","driver":"cst328"}
-{"imu":"ok|off","imu_addr":106,"rtc":"ok|off"}
-{"audio":"ok","mode":"i2s-chirps"}
-{"sd":"ok","mb":122024}
-{"wifi":"no-config|no-ssid|ok"}
 {"hello":"hermes-buddy","transport":"serial+ble-nus"}
 ```
 
@@ -112,15 +136,15 @@ What the device shows/does in plugin mode:
   Page 1 as they happen; every reply also toasts a gold `> HERMES:` banner in
   the bottom band for 4s on whatever page you're on.
 - **Message cards (V1 firmware)** — Page 1 shows two recent-message cards,
-  each 55 px high. Tap a card to read its full retained text; swipe vertically
+  each 55 px high with two preview lines. Tap a card to read its retained text; swipe vertically
   to browse one entry at a time across batches of five, then tap to return to
   the same card position. Text may be shortened to fit the device protocol.
 - **Latest response viewer** — Page 0 keeps the latest assistant response in
   its Markdown viewer. The two-card history reader is separate from that view.
-- **Current rollout** — the messages/emoji V1 image is flashed and hash-
-  verified (`85029efd3a33f3f547cc8c844e34224f9c463ad1182b3f8aa58f12f1e5bfe90e`).
-  The matching host plugin changes remain local and are not deployed to the
-  gateway, so the board still receives preview-only message records.
+- **Current rollout** — the V1 message-reader/themes/audio firmware is flashed and verified.
+  The matching gateway plugin is deployed; previews show two lines, and stable
+  IDs/chunked detail loading support scrolling through retained message text.
+  See the handoff for exact image identities and pending hardware checks.
 - **Inline emoji and icons (3.49 V1 firmware)** — messages, notifications,
   labels, and Markdown display colour emoji, including flags, skin tones, and
   joined sequences, plus Meslo Nerd Font icons. Twemoji artwork by Twitter, Inc.
@@ -146,7 +170,28 @@ What the device shows/does in plugin mode:
 See [`docs/HERMES_INTEGRATION.md`](docs/HERMES_INTEGRATION.md) for the full
 contract.
 
+### V1 themes and device settings
+
+The 3.49 V1 firmware has an eighth tab, **SET**, with Phosphor, Amber, Ocean,
+Paper, and Gruvbox themes. Tap a theme tile to apply it. The same tab controls sound
+mute, face animation, and brightness at 25%, 50%, 75%, or 100%. Settings are
+saved in the `ui` section of the existing `/hermes-buddy-349-v1/config.json`
+without replacing network settings or artwork metadata. Without a writable
+SD card, changes apply for the current session and the device reports that
+they could not be saved. Manual mute remains active after turning the device
+face-up; face-down quiet mode also continues to suppress playback. The avatar
+uses the selected palette; Phosphor preserves its original colors.
+
+FACE and MSGS card previews use the same styled Markdown renderer as the full
+message reader. Supported headings, emphasis, and code retain their styling;
+code uses the theme's code accent and panel background. Preview text remains
+limited by the host's supplied message excerpt.
+
 ### Voice and TTS providers
+
+To trigger a spoken test in a Hermes chat, use `/familiar say Hello from Hermes`.
+Keep the board face-up with SET → SOUND ON. `/familiar ping Test` sends a banner
+and chirp; `/familiar` reports link status. These are gateway chat commands.
 
 Voice is enabled by default and uses the Hermes gateway's configured TTS
 provider. Configure the optional renderer in
@@ -171,6 +216,13 @@ voice and language are `filipp` and `ru-RU`. Yandex configuration can specify
 `"voice": "filipp"` and `"language": "ru-RU"`. Do not put API keys in the
 JSON config. Provider API access and device playback require network access
 from the gateway host and a reachable advertised host address for the device.
+For WSL/NAT deployments, set `HERMES_ADVERTISED_HOST` in the Hermes gateway
+process environment to an IPv4 address reachable from the ESP32; route-derived
+WSL addresses may be private to WSL. Configure routing and firewall for the
+actual host network, keeping HTTP audio (8765) and device TCP (8767) limited
+to a trusted LAN. A host-local HTTP request is not proof of board-to-host
+reachability. The V1 supports playback; microphone capture and speech-to-text
+input are not implemented.
 
 ### Network transports (TCP + WebSocket)
 
@@ -198,7 +250,7 @@ For development without a gateway (or on a machine without Hermes), the
 original polling bridge still works:
 
 ```bash
-python3 scripts/hermes_serial_bridge.py --port /dev/cu.usbmodem2101 --interval 1
+python3 scripts/hermes_serial_bridge.py --port <PORT> --interval 1
 ```
 
 It reads `~/.hermes/state.db` read-only and shares the same
@@ -329,9 +381,12 @@ Host to device:
 `entry_ids` and `msgs.ids` are optional parallel arrays for the existing
 `entries` and `lines` fields. Firmware can request a selected record with
 `{"cmd":"msg","id":"…"}`. The host retains at most 40 detail records and
-caps each stored body at 16 KiB. A detail response is capped at 3200 UTF-8
-body bytes and at 4095 bytes for the complete JSON frame as escaped on the
-wire, so non-ASCII text may be shortened further; `truncated` reports this.
+caps each stored body at 16 KiB. Detail requests optionally include a UTF-8
+byte `offset`; replies carry `body_offset`, `body_total`, `has_more`, and
+`retained_truncated`. The V1 reader fetches successive chunks to display all
+retained text. Each chunk is capped at 3200 UTF-8 bytes and a 4095-byte escaped
+JSON frame. `truncated` also marks remaining chunks for older clients; the
+retention flag marks original bodies longer than 16 KiB.
 An evicted or unknown ID returns an empty body with `error:"stale"`. A
 preview-only record returns `error:"unavailable"` rather than presenting its
 compact preview as full text.
@@ -352,22 +407,73 @@ Device to host:
 
 ## SD asset pipeline
 
-Source art folder:
+The V1 release exporter uses the checked-in `assets/sd_preview/` artwork by
+default, so its 349 V1 pack can be regenerated from this repository without an
+author's download directory.
+
+For the legacy 2.8-inch profile, the original source art folder is supplied by
+the operator and is not part of this repository. Pass its path explicitly to
+the exporter; no author-specific path is assumed:
 
 ```text
-/Users/sem/Downloads/Hermes Familiar
+<source artwork directory>
 ```
 
 Export SD pack:
 
 ```bash
 python3 scripts/export_sd_pack.py \
-  --src "/Users/sem/Downloads/Hermes Familiar" \
+  --src "<source artwork directory>" \
   --out sdcard/hermes-buddy \
   --preview assets/sd_preview
 ```
 
 Copy `sdcard/hermes-buddy` to the root of the FAT32 SD card.
+
+The V1 firmware instead reads `sdcard/hermes-buddy-349-v1/` from the card
+root. Its profile, SD paths, and verified frame hashes are documented in the
+V1 release guide; do not put the legacy and V1 asset packs under an ambiguous
+shared name.
+
+## Waveshare 3.49 V1 setup
+
+The V1 serial device normally appears as `/dev/ttyACM*` on Linux/WSL or
+`/dev/cu.usbmodem*` on macOS. In WSL, attach the ESP32 USB device to the WSL
+distribution before opening the serial bridge. After an upload or USB reset,
+check that it is still attached and reopen the port. The Hermes gateway owns
+the serial connection; stop other serial monitors while using plugin mode.
+Build/upload commands, board-specific pin mapping, and recovery guidance are
+in the V1 release guide.
+
+For Wi-Fi audio or TCP dial-home from a board to Hermes running under WSL,
+configure the board with the gateway host's reachable IPv4 address and set
+`HERMES_ADVERTISED_HOST` in the gateway's environment to the IPv4 address the
+board can reach. WSL's route-derived address may be private to WSL, so verify
+the address from the board's network and allow the documented LAN ports
+(HTTP audio 8765 and device TCP 8767) through the host firewall. USB-local
+speech conversion does not prove this board-to-host route works.
+
+The V1 landscape UI has eight tabs:
+
+| Tab | Contents |
+| --- | --- |
+| FACE | Animated avatar, familiar state, host status, latest assistant response with supported Markdown |
+| MSGS | Two recent message cards with two preview lines; open a retained message and scroll through bounded chunks, or browse five-entry history batches |
+| OPS | Six configurable actions and live approval ALLOW/DENY controls |
+| FLEET | Gateway worker/agent status |
+| CRON | Scheduled jobs and recent results |
+| NET | Gateway, transport, and network status |
+| DEV | Device diagnostics for SD, touch, battery estimate, RTC/IMU, audio, Wi-Fi, and active links |
+| SET | Phosphor, Amber, Ocean, Paper, or Gruvbox theme; sound mute; animation; 25/50/75/100% brightness |
+
+SET preferences are saved under `ui` in
+`/hermes-buddy-349-v1/config.json`; without writable SD storage they are
+session-only. The current image and complete recorded limitations are listed
+in the handoff. In particular, the three older restarts on a superseded image
+remain unexplained, battery ADC accuracy is not calibrated, and the full
+two-hour workload, overnight idle, and power/failure matrix were accepted as
+unperformed at migration closure. User signoff does not turn those checks into
+recorded hardware evidence.
 
 ## Native extension status
 
@@ -376,7 +482,7 @@ The familiar ships as a first-class Hermes plugin (`plugin/`, installed name
 resolve real gateway approvals — no API server or polling required. The
 standalone bridge remains for gateway-less development and remote API mode.
 
-Current board bring-up status from the latest flash:
+Historical 2.8-inch board bring-up notes (not the current V1 status):
 
 - Touch: verified OK.
 - SD: verified OK.

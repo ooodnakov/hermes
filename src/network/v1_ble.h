@@ -10,6 +10,11 @@ namespace network {
 class V1Ble {
  public:
   using LineHandler = void (*)(const char*, void*);
+  struct QueueStats {
+    size_t inputQueuedBytes;
+    size_t outputQueuedBytes;
+    uint32_t sessionResetCalls;
+  };
 
   bool begin();
   void poll(LineHandler handler, void* context);
@@ -27,6 +32,7 @@ class V1Ble {
   uint32_t rejectedWrites() const { return rejectedWrites_; }
   uint32_t framingErrors() const { return framingErrors_; }
   uint32_t notifyFailures() const { return notifyFailures_; }
+  QueueStats queueStats();
   size_t inputHighWater() const { return transport_.inputHighWater(); }
   size_t outputHighWater() const { return transport_.outputHighWater(); }
   uint32_t inputQueueDrops() const { return transport_.inputQueueDrops(); }
@@ -59,6 +65,7 @@ class V1Ble {
   uint16_t mtu_ = 23;
   uint32_t connects_ = 0, disconnects_ = 0, authFailures_ = 0;
   uint32_t rejectedWrites_ = 0, framingErrors_ = 0, notifyFailures_ = 0;
+  uint32_t sessionResetCalls_ = 0;
   bool ready_ = false, connected_ = false, authenticated_ = false, subscribed_ = false;
   char status_[24] = "not-started";
 };

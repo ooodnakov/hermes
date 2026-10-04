@@ -1,6 +1,7 @@
 #include "v1_es8311.h"
 #include "http_pcm.h"
 #include "pcm16.h"
+#include "tone_pcm.h"
 
 #include "../boards/v1/board_config.h"
 #include "../peripherals/bus_lock.h"
@@ -298,9 +299,12 @@ bool writeAndVerifyDacGain(uint8_t gain, uint8_t* actualReadback = nullptr) {
   return true;
 }
 
-bool enableOutput() {
+bool enableOutput(uint8_t gainRegister) {
   peripherals::Wire1Lock lock;
   if (!lock) return false;
+  // Raise the DAC only while an owned playback path is about to become audible.
+  // The matched disableOutput() cleanup restores the conservative idle baseline.
+  if (!writeAndVerifyDacGain(gainRegister)) return false;
   if (!codecSetMuted(false)) return false;
   if (!setExpanderP7(true)) {
     codecSetMuted(true);
@@ -324,13 +328,14 @@ bool disableOutput(bool drainTx) {
         ampDisabled = setExpanderP7(false);
       }
     }
-    if (muted && ampDisabled) return true;
+    if (muted && ampDisabled) break;
     if (attempt + 1 < kOutputCleanupAttempts) vTaskDelay(pdMS_TO_TICKS(10));
   }
   // P7 LOW is the hardware-safe fallback even if codec mute readback failed.
   if (!ampDisabled) setDiagnosticError(DiagnosticError::AmpDisable);
   else if (!muted) setDiagnosticError(DiagnosticError::CodecMute);
-  return false;
+  const bool gainRestored = ampDisabled && writeAndVerifyDacGain(kDacVolumeRegister);
+  return muted && ampDisabled && gainRestored;
 }
 
 bool writeSamples(const int16_t* mono, size_t count, uint32_t timeoutMs) {
@@ -441,7 +446,7 @@ bool V1Es8311::playMonoPcm(const int16_t* samples, size_t count) {
     setDiagnosticError(DiagnosticError::QuietMode);
     return false;
   }
-  if (!enableOutput()) {
+  if (!enableOutput(kVendorMaxGainRegister)) {
     disableOutput(false);
     releasePcm();
     return false;
@@ -465,26 +470,21 @@ bool V1Es8311::playMonoPcm(const int16_t* samples, size_t count) {
   return ok && cleanupOk;
 }
 
-bool V1Es8311::emitTone(uint16_t hz, uint16_t ms, bool& outputActive) {
+bool V1Es8311::emitTone(uint16_t hz, uint16_t ms, uint8_t gainRegister, bool& outputActive) {
   const uint32_t count = kSampleRate * ms / 1000;
   int16_t samples[kMonoChunkSamples];
   const uint32_t halfPeriod = max<uint32_t>(1, kSampleRate / (hz * 2));
   for (uint32_t done = 0; done < count;) {
     if (quiet()) return false;
     const size_t n = min<uint32_t>(kMonoChunkSamples, count - done);
-    for (size_t i = 0; i < n; ++i) {
-      const uint32_t s = done + i;
-      int32_t amp = (((s / halfPeriod) & 1) ? 1800 : -1800);
-      if (s < 24) amp = amp * static_cast<int32_t>(s) / 24;
-      if (count - s < 24) amp = amp * static_cast<int32_t>(count - s) / 24;
-      samples[i] = static_cast<int16_t>(amp);
-    }
     if (!outputActive) {
-      if (!writeMonoSamples(samples, n, 20) || !enableOutput()) return false;
+      int16_t silence[kMonoChunkSamples];
+      fillSilenceSamples(silence, kMonoChunkSamples);
+      if (!writeMonoSamples(silence, kMonoChunkSamples, 20) || !enableOutput(gainRegister)) return false;
       outputActive = true;
-    } else if (!writeMonoSamples(samples, n, 20)) {
-      return false;
     }
+    fillSquareToneSamples(samples, n, done, count, halfPeriod);
+    if (!writeMonoSamples(samples, n, 20)) return false;
     done += n;
   }
   return true;
@@ -506,12 +506,22 @@ bool V1Es8311::chirp(const char* kind) {
   }
   bool outputActive = false;
   bool played = false;
-  if (!strcmp(kind, "boot")) played = emitTone(740, 35, outputActive) && emitTone(988, 45, outputActive);
-  else if (!strcmp(kind, "tap")) played = emitTone(1200, 20, outputActive);
-  else if (!strcmp(kind, "alert")) played = emitTone(988, 35, outputActive) && emitTone(740, 60, outputActive);
-  else if (!strcmp(kind, "ack")) played = emitTone(880, 25, outputActive) && emitTone(1320, 35, outputActive);
-  else if (!strcmp(kind, "test")) played = emitTone(880, 75, outputActive);
-  else played = emitTone(880, 25, outputActive);
+  if (!strcmp(kind, "boot")) {
+    played = emitTone(740, 35, kVendorMaxGainRegister, outputActive) &&
+             emitTone(988, 45, kVendorMaxGainRegister, outputActive);
+  } else if (!strcmp(kind, "tap")) {
+    played = emitTone(1200, 20, kVendorMaxGainRegister, outputActive);
+  } else if (!strcmp(kind, "alert")) {
+    played = emitTone(kAlertToneProfile.frequencyHz, kAlertToneProfile.durationMs,
+                      kVendorMaxGainRegister, outputActive);
+  } else if (!strcmp(kind, "ack")) {
+    played = emitTone(880, 25, kVendorMaxGainRegister, outputActive) &&
+             emitTone(1320, 35, kVendorMaxGainRegister, outputActive);
+  } else if (!strcmp(kind, "test")) {
+    played = emitTone(880, 75, kVendorMaxGainRegister, outputActive);
+  } else {
+    played = emitTone(880, 25, kVendorMaxGainRegister, outputActive);
+  }
   played = disableOutput(outputActive) && played;
   releaseChirp();
   finishChirpDiagnostic(played);
@@ -549,7 +559,8 @@ bool V1Es8311::audioTest(int gainRegister) {
   const bool startSafe = disableOutput(false);
   const bool testGainSet = startSafe && writeAndVerifyDacGain(static_cast<uint8_t>(gainRegister), &testReadback);
   const uint16_t durationMs = gainRegister == kVendorMaxGainRegister ? 200 : 75;
-  const bool tonePlayed = testGainSet && emitTone(880, durationMs, outputActive);
+  const bool tonePlayed = testGainSet &&
+      emitTone(880, durationMs, static_cast<uint8_t>(gainRegister), outputActive);
   const bool stopped = disableOutput(outputActive);
   const bool baselineWritten = writeAndVerifyDacGain(kDacVolumeRegister);
   const bool idleSafe = disableOutput(false);
@@ -740,7 +751,7 @@ bool V1Es8311::playUrlWorker(const String& url) {
                 failure = DiagnosticError::I2sWrite;
                 break;
               }
-              if (!enableOutput()) {
+              if (!enableOutput(kVendorMaxGainRegister)) {
                 failure = diagnostics().lastError;
                 break;
               }

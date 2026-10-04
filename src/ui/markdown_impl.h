@@ -261,7 +261,7 @@ inline bool blankLine(std::string_view line) {
 
 }  // namespace detail
 
-inline bool parse(std::string_view source, Document& output) {
+inline bool parseImpl(std::string_view source, Document& output, bool keepPrefix) {
   output.clear();
   if (source.size() > kMaxSourceBytes) return false;
   if (source.empty()) return true;
@@ -287,6 +287,7 @@ inline bool parse(std::string_view source, Document& output) {
     if (inFence) {
       if (detail::isFenceClose(line, fenceMarker, fenceLength)) {
         if (!codeContent.empty() && !detail::addSpan(output, codeBlock, codeContent, InlineCode)) {
+          if (keepPrefix) { output.truncated = true; return true; }
           output.clear();
           return false;
         }
@@ -303,6 +304,7 @@ inline bool parse(std::string_view source, Document& output) {
       if (detail::parseFence(line, marker, count, after)) {
         paragraph = std::numeric_limits<std::uint16_t>::max();
         if (!detail::beginBlock(output, BlockKind::CodeBlock, codeBlock)) {
+          if (keepPrefix) { output.truncated = true; return true; }
           output.clear();
           return false;
         }
@@ -314,6 +316,7 @@ inline bool parse(std::string_view source, Document& output) {
         paragraph = std::numeric_limits<std::uint16_t>::max();
         std::uint16_t blank = 0;
         if (!detail::beginBlock(output, BlockKind::Blank, blank)) {
+          if (keepPrefix) { output.truncated = true; return true; }
           output.clear();
           return false;
         }
@@ -326,18 +329,21 @@ inline bool parse(std::string_view source, Document& output) {
           if (!detail::beginBlock(output, parsed.kind, block,
                                   parsed.heading, parsed.number) ||
               !detail::parseInline(output, block, line.substr(parsed.content))) {
+            if (keepPrefix) { output.truncated = true; return true; }
             output.clear();
             return false;
           }
         } else {
           if (paragraph == std::numeric_limits<std::uint16_t>::max() &&
               !detail::beginBlock(output, BlockKind::Paragraph, paragraph)) {
+            if (keepPrefix) { output.truncated = true; return true; }
             output.clear();
             return false;
           }
           if ((output.blocks[paragraph].spanCount &&
                !detail::addSpan(output, paragraph, "\n", Plain)) ||
               !detail::parseInline(output, paragraph, line)) {
+            if (keepPrefix) { output.truncated = true; return true; }
             output.clear();
             return false;
           }
@@ -351,10 +357,19 @@ inline bool parse(std::string_view source, Document& output) {
   // An unclosed fence follows the usual Markdown convention: it runs to EOF.
   if (inFence && !codeContent.empty() &&
       !detail::addSpan(output, codeBlock, codeContent, InlineCode)) {
+    if (keepPrefix) { output.truncated = true; return true; }
     output.clear();
     return false;
   }
   return true;
+}
+
+inline bool parse(std::string_view source, Document& output) {
+  return parseImpl(source, output, false);
+}
+
+inline bool parsePrefix(std::string_view source, Document& output) {
+  return parseImpl(source, output, true);
 }
 
 }  // namespace ui::markdown

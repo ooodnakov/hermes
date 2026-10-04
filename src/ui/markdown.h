@@ -8,7 +8,7 @@
 
 namespace ui::markdown {
 
-constexpr std::size_t kMaxSourceBytes = 4095;
+constexpr std::size_t kMaxSourceBytes = 16 * 1024;
 constexpr std::size_t kMaxBlocks = 128;
 constexpr std::size_t kMaxSpans = 512;
 constexpr std::size_t kMaxDestinationBytes = 2048;
@@ -59,12 +59,14 @@ struct Document {
   std::string destinations;
   std::vector<Block> blocks;
   std::vector<Span> spans;
+  bool truncated = false;
 
   void clear() {
     text.clear();
     destinations.clear();
     blocks.clear();
     spans.clear();
+    truncated = false;
   }
 };
 
@@ -72,6 +74,11 @@ struct Document {
 // output-limit overflow is rejected and clears output; malformed/unmatched
 // markup stays literal.
 bool parse(std::string_view source, Document& output);
+
+// Like parse(), but preserves the parsed prefix that fits the document
+// limits and sets Document::truncated when the remainder cannot be parsed.
+// Inputs above kMaxSourceBytes are still rejected and clear the output.
+bool parsePrefix(std::string_view source, Document& output);
 
 }  // namespace ui::markdown
 

@@ -1,6 +1,7 @@
 #include "../../src/protocol/ui_state.h"
 
 #include <ArduinoJson.h>
+#include <algorithm>
 #include <cassert>
 #include <string>
 
@@ -153,7 +154,7 @@ void testMessageDetailUtf8CapAndStrictTruncatedBoolean() {
   state.modalActive = true;
   state.messageDetailPending = true;
   state.messageDetailRequestedId = "large";
-  const std::string body = std::string(3199, 'a') + "Жtail";
+  const std::string body = std::string(4000, 'a') + "Жtail";
   JsonDocument frame;
   frame["type"] = "msg";
   frame["id"] = "large";
@@ -161,9 +162,9 @@ void testMessageDetailUtf8CapAndStrictTruncatedBoolean() {
   frame["role"] = "assistant";
   frame["truncated"] = "false";  // wrong JSON type must not coerce to true
   assert(protocol::applyJsonFrame(state, serialize(frame), 400));
-  assert(state.messageDetailBody.length() == 3199);
-  assert(state.messageDetailBody.str() == std::string(3199, 'a'));
-  assert(state.messageDetailTruncated);
+  assert(state.messageDetailBody.length() == body.size());
+  assert(state.messageDetailBody.str() == body);
+  assert(!state.messageDetailTruncated);
 
   state.messageDetailPending = true;
   state.messageDetailRequestedId = "host-clipped";
@@ -174,6 +175,116 @@ void testMessageDetailUtf8CapAndStrictTruncatedBoolean() {
   clipped["truncated"] = true;
   assert(protocol::applyJsonFrame(state, serialize(clipped), 500));
   assert(state.messageDetailTruncated);
+}
+
+String makeMessageDetailPage(const char* id, uint32_t offset, uint32_t total,
+                             const std::string& body, bool hasMore,
+                             bool retainedTruncated = false) {
+  JsonDocument document;
+  document["type"] = "msg";
+  document["id"] = id;
+  document["body_offset"] = offset;
+  document["body_total"] = total;
+  document["body"] = body;
+  document["role"] = "assistant";
+  document["has_more"] = hasMore;
+  document["truncated"] = hasMore || retainedTruncated;
+  document["retained_truncated"] = retainedTruncated;
+  return serialize(document);
+}
+
+void testMessageDetailPagesAppendInUtf8ByteOrderAndUseFinalRetentionFlag() {
+  protocol::UiState state;
+  state.modalActive = true;
+  state.messageDetailPending = true;
+  state.messageDetailRequestedId = "paged";
+  const std::string first = "**Привет** ";
+  const uint32_t next = static_cast<uint32_t>(first.size());
+  assert(protocol::applyJsonFrame(
+      state, makeMessageDetailPage("paged", 0, next + 12, first, true), 100));
+  assert(state.messageDetailBody.str() == first);
+  assert(state.messageDetailHasMore && !state.messageDetailTruncated);
+  assert(state.messageDetailNextOffset == next);
+
+  state.messageDetailPending = true;
+  state.messageDetailRequestedOffset = next;
+  assert(!protocol::applyJsonFrame(
+      state, makeMessageDetailPage("paged", next, next + 12, "", true), 150));
+  JsonDocument oversized;
+  oversized["type"] = "msg";
+  oversized["id"] = "paged";
+  oversized["body_offset"] = next;
+  oversized["body_total"] = 16385;
+  oversized["body"] = "x";
+  oversized["has_more"] = true;
+  assert(!protocol::applyJsonFrame(state, serialize(oversized), 175));
+  assert(!protocol::applyJsonFrame(
+      state, makeMessageDetailPage("paged", next + 1, next + 12, "wrong", false), 200));
+  assert(state.messageDetailPending && state.messageDetailBody.str() == first);
+
+  const std::string final = "and **done**";
+  assert(protocol::applyJsonFrame(
+      state, makeMessageDetailPage("paged", next, next + final.size(), final, false, true), 300));
+  assert(!state.messageDetailPending && !state.messageDetailHasMore);
+  assert(state.messageDetailBody.str() == first + final);
+  assert(state.messageDetailTruncated);  // Source exceeded host retention cap.
+
+  state.messageDetailRequestedId = "large-paged";
+  state.messageDetailPending = true;
+  state.messageDetailRequestedOffset = 0;
+  state.messageDetailBody = "";
+  state.messageDetailTruncated = false;
+  state.messageDetailHasMore = false;
+  std::string assembled;
+  for (uint32_t offset = 0; offset < 16384;) {
+    const uint32_t total = 16384;
+    const std::string page(std::min<uint32_t>(2800, total - offset), 'z');
+    const uint32_t nextOffset = offset + static_cast<uint32_t>(page.size());
+    state.messageDetailPending = true;
+    state.messageDetailRequestedOffset = offset;
+    const bool hasMore = nextOffset < total;
+    assert(protocol::applyJsonFrame(
+        state, makeMessageDetailPage("large-paged", offset, total, page, hasMore, true),
+        400 + offset));
+    assembled += page;
+    offset = nextOffset;
+  }
+  assert(state.messageDetailBody.length() == 16384);
+  assert(state.messageDetailBody.str() == assembled);
+  assert(!state.messageDetailHasMore && state.messageDetailTruncated);
+}
+
+void testMalformedPagingAndLateOffsetErrorAreRejected() {
+  protocol::UiState state;
+  state.modalActive = true;
+  state.messageDetailPending = true;
+  state.messageDetailRequestedId = "same-id";
+  state.messageDetailRequestedOffset = 2800;
+
+  JsonDocument malformed;
+  malformed["type"] = "msg";
+  malformed["id"] = "same-id";
+  malformed["body"] = "body";
+  malformed["body_offset"] = "2800";
+  malformed["body_total"] = "4000";
+  malformed["has_more"] = "true";
+  assert(!protocol::applyJsonFrame(state, serialize(malformed), 100));
+  assert(state.messageDetailPending && state.messageDetailBody.isEmpty());
+
+  JsonDocument lateError;
+  lateError["type"] = "msg";
+  lateError["id"] = "same-id";
+  lateError["body_offset"] = 0;
+  lateError["body_total"] = 4000;
+  lateError["has_more"] = false;
+  lateError["error"] = "stale offset";
+  assert(!protocol::applyJsonFrame(state, serialize(lateError), 200));
+  assert(state.messageDetailPending);
+
+  lateError["body_offset"] = 2800;
+  assert(protocol::applyJsonFrame(state, serialize(lateError), 300));
+  assert(!state.messageDetailPending);
+  assert(state.messageDetailError.str() == "stale offset");
 }
 
 void testMessageDetailNotFoundAndMalformedResponses() {
@@ -271,6 +382,8 @@ int main() {
   testHistoryIdsAreBoundedAndClearWithEachWindow();
   testMessageDetailRequiresCurrentOpenPendingRequest();
   testMessageDetailUtf8CapAndStrictTruncatedBoolean();
+  testMessageDetailPagesAppendInUtf8ByteOrderAndUseFinalRetentionFlag();
+  testMalformedPagingAndLateOffsetErrorAreRejected();
   testMessageDetailNotFoundAndMalformedResponses();
   testTransientPageCancelsDetailAndIgnoresLateReply();
   testPermissionTakeoverCancelsMessageDetailRequest();

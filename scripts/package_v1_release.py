@@ -49,7 +49,8 @@ def validate_flash_artifacts(artifacts: dict[str, Path]) -> None:
                 "boot_app0.bin": 0x2000, "hermes-familiar-waveshare-349-v1.bin": None}
     for name, size in expected.items():
         path = artifacts[name]
-        if not path.is_file() or (size is not None and path.stat().st_size != size):
+        if (not path.is_file() or path.stat().st_size == 0
+                or (size is not None and path.stat().st_size != size)):
             raise ValueError(f"missing or unexpected V1 flash artifact: {name}")
 
 
@@ -262,8 +263,7 @@ original 2.8-inch board. Firmware SHA-256: {firmware_hash}
 Firmware artifacts are in firmware/. The SD card asset folder is
 sdcard/{ASSET_DIR}/; copy that folder to the root of a FAT32 SD card.
 Verify files using manifest.json before copying or flashing. Component binary
-offsets are recorded there; direct standalone esptool flashing has not been
-exercised for this bundle.
+offsets are recorded there.
 
 To build and upload from the source checkout, select the V1 environment and
 the serial port that you have identified for this board:
@@ -271,12 +271,24 @@ the serial port that you have identified for this board:
   pio run -e {ENV} -t upload --upload-port <PORT>
 
 USB serial runs at 115200 baud. This command rebuilds from the source checkout
-before uploading; it does not write the packaged binary directly. Select the
-verified serial port for this board. Do not select the 2.8-inch environment.
+before uploading; it does not write the packaged binary directly. For
+recovery, keep this complete bundle and a known-good earlier bundle available,
+then rebuild and upload with the V1 environment. Do not select the 2.8-inch
+environment. Direct standalone flashing of these packaged components has not
+been exercised.
 
-Known limits: the battery voltage ADC has not been calibrated against a
-reference. Audio-ready diagnostics do not establish normal-volume speech
-audibility. See the repository's 349 V1 handoff for current hardware evidence.
+Operator confirmation: normal Yandex speech works well, and the operator
+reports the current UI and audio are working. Battery voltage calibration,
+corner/gesture/audio calibration, power and failure checks, extended workload
+and overnight idle checks, and standalone component flashing remain
+unperformed. See the repository's 349 V1 handoff for dated evidence.
+
+User network and UI settings live in the SD card config and are not included
+in this bundle. Firmware upload leaves that SD config in place, and firmware
+config updates merge their fields while preserving unrelated settings. During
+recovery, keep the existing SD card and config; do not replace them with the
+bundled default asset config. For a fresh SD card, copy the bundled asset
+folder to the FAT32 card root.
 
 Pin map: QSPI display CS/CLK/D0-D3 = GPIO 9/10/11-14, reset GPIO 21,
 backlight GPIO 8; touch I2C SDA/SCL = GPIO 17/18; peripheral I2C SDA/SCL =

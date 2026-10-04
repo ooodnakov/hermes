@@ -7,7 +7,7 @@ namespace protocol {
 namespace {
 constexpr size_t kMaxAgentMarkdownBytes = 3072;
 constexpr size_t kMaxMessageIdBytes = 128;
-constexpr size_t kMaxMessageDetailBytes = 3200;
+constexpr size_t kMaxMessageDetailBytes = 16 * 1024;
 
 String textOr(JsonVariantConst value, const char* fallback = "") {
   return value.is<const char*>() ? String(value.as<const char*>()) : String(fallback);
@@ -61,6 +61,10 @@ void clearMessageDetailRequest(UiState& s) {
   s.messageDetailError = "";
   s.messageDetailPending = false;
   s.messageDetailTruncated = false;
+  s.messageDetailHasMore = false;
+  s.messageDetailRequestedOffset = 0;
+  s.messageDetailNextOffset = 0;
+  s.messageDetailTotalBytes = 0;
 }
 
 void markLive(UiState& s, uint32_t nowMs) {
@@ -148,13 +152,61 @@ bool applyJsonFrame(UiState& s, const String& line, uint32_t nowMs) {
     const bool hasBody = root["body"].is<const char*>();
     const bool hasError = root["error"].is<const char*>() && root["error"].as<const char*>()[0];
     if (!hasBody && !hasError) return false;
-    bool locallyTruncated = false;
-    s.messageDetailBody = boundedUtf8(root["body"], kMaxMessageDetailBytes, locallyTruncated);
-    s.messageDetailRole = boundedText(root["role"], 32);
-    s.messageDetailError = hasError ? boundedText(root["error"], 160) : "";
-    s.messageDetailTruncated = locallyTruncated ||
-        (root["truncated"].is<bool>() && root["truncated"].as<bool>());
-    s.messageDetailPending = false;
+    const bool hasPagingFields = !root["body_offset"].isNull() ||
+                                 !root["body_total"].isNull() ||
+                                 !root["has_more"].isNull();
+    if (hasPagingFields && (!root["body_offset"].is<uint32_t>() ||
+                            !root["body_total"].is<uint32_t>() ||
+                            !root["has_more"].is<bool>() ||
+                            root["body_total"].as<uint32_t>() > kMaxMessageDetailBytes))
+      return false;
+    if (hasError) {
+      if (hasPagingFields &&
+          root["body_offset"].as<uint32_t>() != s.messageDetailRequestedOffset) return false;
+      s.messageDetailError = boundedText(root["error"], 160);
+      s.messageDetailPending = false;
+      s.messageDetailHasMore = false;
+    } else {
+      const bool paged = hasPagingFields;
+      const uint32_t bodyOffset = paged ? root["body_offset"].as<uint32_t>() : 0;
+      bool locallyTruncated = false;
+      String body = boundedUtf8(root["body"], kMaxMessageDetailBytes, locallyTruncated);
+      if (paged && (bodyOffset != s.messageDetailRequestedOffset ||
+                    bodyOffset != s.messageDetailBody.length() ||
+                    body.length() > kMaxMessageDetailBytes - s.messageDetailBody.length())) {
+        return false;
+      }
+      if (paged) {
+        const uint32_t total = root["body_total"].as<uint32_t>();
+        const bool hasMore = root["has_more"].is<bool>() && root["has_more"].as<bool>();
+        const uint32_t nextOffset = bodyOffset + body.length();
+        if (nextOffset < bodyOffset || (hasMore && (body.isEmpty() || nextOffset >= total)) ||
+            (bodyOffset && s.messageDetailTotalBytes != total) ||
+            (!hasMore && total && nextOffset != total)) return false;
+        s.messageDetailBody += body;
+        s.messageDetailNextOffset = nextOffset;
+        s.messageDetailTotalBytes = total;
+        s.messageDetailHasMore = hasMore && nextOffset < kMaxMessageDetailBytes;
+        const bool retainedTruncated = root["retained_truncated"].is<bool>()
+            ? root["retained_truncated"].as<bool>()
+            : (!root["has_more"].is<bool>() &&
+               root["truncated"].is<bool>() && root["truncated"].as<bool>());
+        s.messageDetailTruncated = locallyTruncated || retainedTruncated ||
+                                   (nextOffset >= kMaxMessageDetailBytes && hasMore);
+        s.messageDetailRole = boundedText(root["role"], 32);
+        s.messageDetailError = "";
+      } else {
+        s.messageDetailBody = body;
+        s.messageDetailHasMore = false;
+        s.messageDetailNextOffset = body.length();
+        s.messageDetailTotalBytes = body.length();
+        s.messageDetailRole = boundedText(root["role"], 32);
+        s.messageDetailError = "";
+        s.messageDetailTruncated = locallyTruncated ||
+            (root["truncated"].is<bool>() && root["truncated"].as<bool>());
+      }
+      s.messageDetailPending = false;
+    }
     markLive(s, nowMs);
     return true;
   }
