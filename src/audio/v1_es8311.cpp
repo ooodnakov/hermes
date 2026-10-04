@@ -1,4 +1,5 @@
 #include "v1_es8311.h"
+#include "http_pcm.h"
 #include "pcm16.h"
 
 #include "../boards/v1/board_config.h"
@@ -684,7 +685,7 @@ bool V1Es8311::playUrlWorker(const String& url) {
       }
     }
   }
-  if (begun && status == HTTP_CODE_OK) {
+  if (begun && status == HTTP_CODE_OK && failure == DiagnosticError::None) {
     if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
       failure = DiagnosticError::OwnerTimeout;
     } else {
@@ -698,18 +699,25 @@ bool V1Es8311::playUrlWorker(const String& url) {
       if (total > static_cast<int>(kMaxSpeechBytes)) failure = DiagnosticError::HttpTooLarge;
       else if (total == 0) failure = DiagnosticError::PcmMalformed;
       while (failure == DiagnosticError::None &&
-             http.connected() && (total < 0 || received < static_cast<size_t>(total))) {
-        if (quiet()) {
-          failure = DiagnosticError::QuietMode;
-          break;
+             httpPcmHasInput(http.connected(), stream->available(), total, received)) {
+        const uint32_t now = millis();
+        switch (playbackStop(quiet(), now - started, now - lastData,
+                             kMaxSpeechTaskMs, 3000)) {
+          case PlaybackStop::Quiet:
+            failure = DiagnosticError::QuietMode;
+            break;
+          case PlaybackStop::TaskTimeout:
+          case PlaybackStop::IdleTimeout:
+            failure = DiagnosticError::HttpTimeout;
+            break;
+          case PlaybackStop::None:
+            break;
         }
-        if (millis() - started >= kMaxSpeechTaskMs) {
-          failure = DiagnosticError::HttpTimeout;
-          break;
-        }
+        if (failure != DiagnosticError::None) break;
         const size_t available = stream->available();
         if (available) {
-          const size_t want = min(available, sizeof(raw));
+          size_t want = min(available, sizeof(raw));
+          if (total >= 0) want = min(want, static_cast<size_t>(total) - received);
           const int bytes = stream->readBytes(raw, want);
           if (bytes <= 0) {
             failure = DiagnosticError::HttpTimeout;
@@ -743,20 +751,23 @@ bool V1Es8311::playUrlWorker(const String& url) {
             }
           }
           lastData = millis();
-        } else {
-          if (millis() - lastData >= 3000) {
-            failure = DiagnosticError::HttpTimeout;
-            break;
-          }
-          vTaskDelay(pdMS_TO_TICKS(5));
-        }
+        } else vTaskDelay(pdMS_TO_TICKS(5));
       }
       if (failure == DiagnosticError::None) {
-        if (!decoder.complete()) failure = DiagnosticError::PcmMalformed;
-        else if (!received) failure = DiagnosticError::PcmMalformed;
-        else if (total >= 0 && received != static_cast<size_t>(total)) failure = DiagnosticError::HttpTimeout;
-        else if (total < 0 && http.connected()) failure = DiagnosticError::HttpTimeout;
-        else ok = true;
+        switch (finishHttpPcm(decoder.complete(), received, total, http.connected(),
+                              stream->available())) {
+          case HttpPcmCompletion::Complete:
+            ok = true;
+            break;
+          case HttpPcmCompletion::Empty:
+          case HttpPcmCompletion::Malformed:
+            failure = DiagnosticError::PcmMalformed;
+            break;
+          case HttpPcmCompletion::Truncated:
+          case HttpPcmCompletion::StillConnected:
+            failure = DiagnosticError::HttpTimeout;
+            break;
+        }
       }
       if (!disableOutput(outputActive)) {
         ok = false;
