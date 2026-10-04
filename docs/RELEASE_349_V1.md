@@ -20,9 +20,20 @@ Build toolchain recorded in that package: PlatformIO Core 6.2.0, pioarduino
 platform 55.03.30, Arduino ESP32 3.3.0, ESP-IDF 5.5.0, Xtensa toolchain
 14.2.0+20241119, ArduinoJson 7.4.2, LovyanGFX 1.2.30, and NimBLE-Arduino
 2.5.1. V1 memory report: 95,180 / 327,680 bytes RAM and 5,127,419 /
-13,631,488 bytes flash. The source workflow also emits a GitHub Actions
-artifact named `hermes-familiar-waveshare-349-v1-release`, containing the full
-V1 release package. Record the corresponding run result after it completes.
+13,631,488 bytes flash. The source workflow emits a GitHub Actions artifact
+named `hermes-familiar-waveshare-349-v1-release`, containing the full V1
+release package. PR [#6](https://github.com/ooodnakov/hermes/pull/6) is open;
+its CI [run 37206617267](https://github.com/ooodnakov/hermes/actions/runs/37206617267)
+passed. The branch push workflow is pending and the PR has not merged.
+
+A fresh clean clone at source commit `65ea078` built all three environments,
+passed 141 tests and 20,810 subtests, and passed the release-package validator
+(33 files, 20 SD frames, clean source manifest, packaged app byte-identical to
+the clean-checkout build). That build's application SHA-256 is
+`eee364e5853aa8d33a0488338eea9e1568e8c10d0814ee0a70b59486cda26360`.
+It differs from the flashed image above because embedded source/build timestamp
+metadata changed; the board was not reflashed. This records clean-checkout
+build/package identity without conflating the two binary hashes.
 
 The private 16 MB pre-migration flash backup and its restore instructions are
 kept outside the repository and are not in this release package. Never use

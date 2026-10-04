@@ -12,9 +12,9 @@ means implementation/evidence review and user-accepted closure; it does not
 claim that every proposed hardware test passed. The historical three reset
 causes remain unknown.
 
-- Current V1 app SHA-256: `93c7444b1d2541f2468db452b7a9dae86d023d78e96b40e7e2e5938f75f4147b` (5,127,824 bytes); esptool upload hash verification matched. Its local bundle is `dist/waveshare-349-v1-alert-preroll-20261004/`. Bundle metadata names source commit `61ee9ebe8177d7804c5d850cd935be673c36a3ad`, records that the build tree had local changes, PlatformIO Core 6.2.0, pioarduino 55.03.30, Arduino ESP32 3.3.0 / ESP-IDF 5.5.0, and per-file SHA-256 hashes. Current V1 RAM/flash report is 95,180 / 327,680 and 5,127,419 / 13,631,488 bytes.
+- The flashed V1 app SHA-256 is `93c7444b1d2541f2468db452b7a9dae86d023d78e96b40e7e2e5938f75f4147b` (5,127,824 bytes), verified by esptool. A clean sequential build from published source commit `65ea078` passed all three firmware environments and 141 tests / 20,810 subtests (21.52 s). The clean bundle validator verified 33 files, 20 frames, clean manifest source `65ea078`, and byte identity between the packaged app and the clean-checkout build. That rebuilt app hash is `eee364e5853aa8d33a0488338eea9e1568e8c10d0814ee0a70b59486cda26360`; it differs from the still-flashed `93c7444b` image because embedded source/build timestamp metadata changed. The board was not reflashed. PR [#6](https://github.com/ooodnakov/hermes/pull/6) is open and attached. PR CI [run 37206617267](https://github.com/ooodnakov/hermes/actions/runs/37206617267) passed; the branch push workflow is still pending, and merge has not occurred.
 - The user reports the current UI and sound work, confirmed normal Yandex speech, and explicitly heard the 200 ms test tone at gain 0xBA. Separate evidence covers authenticated retained-message transfer (16 KiB over six bounded chunks), host-side gateway integration and provider behavior, and the board upload. The latest passive capture recorded 179 seconds without uptime rollback; it did not exercise ping and is not two-hour soak evidence.
-- Root validation for this closeout reports 141 host tests and 20,810 subtests, all three firmware builds, and `git diff --check` passing. These are local working-tree checks; publication/merge and clean-checkout/package validation are being completed separately and must be recorded after they actually finish.
+- The branch has been pushed and PR #6 opened. Clean-checkout build/package validation and PR CI passed as recorded above. The branch push workflow and merge remain pending; update this record after those operations finish.
 - Release profile, generic serial instructions, eight-page UI, V1 SD path, pins, and recovery notes are in [RELEASE_349_V1.md](RELEASE_349_V1.md). Do not use the legacy 2.8 profile or its asset path for V1. The private pre-migration full-flash backup and restore details remain outside Git. No credentials, board serials, or machine paths belong in the release.
 - Limitations retained at closeout: the 3.49 battery ADC has not been calibrated against a reference; RTC power-loss retention and long-term accuracy are unverified; full gesture/axis calibration, two-hour combined workload, overnight idle, and the full failure/power matrix were not run. The historic three restarts on a replaced image remain unexplained. The user's general signoff closes these tasks but is not a substitute for recorded measurements.
 - The current README and release guide describe the current 3.49 V1 profile separately from the original 2.8-inch firmware. The website's 2.8 factory image is not renamed or replaced by these V1 artifacts.
@@ -79,6 +79,21 @@ for the distinction between completed implementation, recorded evidence, and
 physical checks accepted as unperformed. No additional physical test is
 implied by this closure. Publication and merge results will be recorded only
 after the repository operation completes.
+
+## T38 publication and clean-checkout validation — 2026-10-04
+
+The release documentation and source were committed as `65ea078`, pushed to
+the user's fork branch, and opened as [PR #6](https://github.com/ooodnakov/hermes/pull/6).
+A fresh clean Git clone at that commit built all three PlatformIO environments
+sequentially, passed 141 host tests and 20,810 subtests in 21.52 seconds, and
+passed the package validator for 33 files and 20 SD frames. The clean package
+manifest identifies source `65ea078`; its application is byte-identical to
+the V1 build from that clean checkout. Build app SHA-256:
+`eee364e5853aa8d33a0488338eea9e1568e8c10d0814ee0a70b59486cda26360`.
+It differs from the image still on the board (`93c7444b1d2541f2468db452b7a9dae86d023d78e96b40e7e2e5938f75f4147b`)
+because embedded source/build timestamp metadata changed; no reflash was
+performed. PR CI [run 37206617267](https://github.com/ooodnakov/hermes/actions/runs/37206617267)
+passed. The branch push workflow remains pending and the PR is not yet merged.
 
 The detailed 38-task backlog is in [MIGRATION_ESP32_S3_TOUCH_LCD_349_V1.md](MIGRATION_ESP32_S3_TOUCH_LCD_349_V1.md). Start by reading this handoff plus the current working tree; do not redo the completed discovery or initial bring-up.
 
