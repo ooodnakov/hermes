@@ -50,6 +50,39 @@ void testRtcSampleTimestampTracksCompleteReadsOnly() {
   assert(sensors.snapshot().rtcSampledAtMs > firstSample);
 }
 
+void testSchedulerKeepsCadenceAcrossLateCallsAndMillisRollover() {
+  constexpr uint32_t start = 0xfffffff0u;
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  analogReadCount = 0;
+  peripherals::Sensors sensors;
+  sensors.begin(bus, start);
+  const uint32_t initialAdcReads = analogReadCount;
+  const int initialRequests = bus.requestCount;
+
+  sensors.update(start + 19);
+  assert(bus.requestCount == initialRequests);
+  sensors.update(start + 25);  // Six milliseconds late for the IMU slot.
+  assert(bus.requestCount == initialRequests + 1);
+  sensors.update(start + 40);  // The next slot remains anchored at 40 ms.
+  assert(bus.requestCount == initialRequests + 2);
+
+  sensors.update(start + 1005);  // Five milliseconds late across rollover.
+  assert(analogReadCount == initialAdcReads + 8);
+  const int afterLateSecond = bus.requestCount;
+  sensors.update(start + 2000);  // RTC/battery cadence remains anchored.
+  assert(analogReadCount == initialAdcReads + 16);
+  assert(bus.requestCount >= afterLateSecond + 2);  // RTC and IMU both sampled.
+
+  sensors.update(start + 10000);  // A long pause performs one sample per sensor.
+  const uint32_t afterPauseAdcReads = analogReadCount;
+  sensors.update(start + 10000);
+  assert(analogReadCount == afterPauseAdcReads);  // No catch-up burst at one timestamp.
+}
+
 void testInvalidBcdAndImpossibleCalendar() {
   TwoWire badBcd;
   setValidRtc(badBcd);
@@ -141,6 +174,20 @@ void testFailedWriteRestartsAndNeverRevalidatesPartialCalendar() {
   assert(!sensors.snapshot().rtcTimeValid);  // The failure latch blocks partial-data promotion.
 }
 
+void testFailedStopWriteRetriesOriginalControlCleanup() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kRtc, 0x00, 0x81);
+  peripherals::Sensors sensors;
+  sensors.begin(bus, 0);
+  const int stopWrite = bus.transactionCount + 2;
+  bus.failTransactions = {stopWrite, stopWrite + 1};
+  assert(!sensors.setRtcDateTime(2025, 1, 2, 3, 4, 5));
+  assert(bus.transactionCount == stopWrite + 2);
+  assert(bus.get(kRtc, 0x00) == 0x81);
+  assert(!sensors.snapshot().rtcTimeValid);
+}
+
 void testFailedSetPreservesOriginallyStoppedClock() {
   TwoWire bus;
   setValidRtc(bus);
@@ -201,6 +248,25 @@ void testImuSamplingRestoresReadyAfterTransientReadError() {
   sensors.update(600);
   assert(sensors.snapshot().imuReady && sensors.snapshot().accelerationReady);
   assert(sensors.snapshot().imuErrors == 1);
+}
+
+void testMissingImuAtBootRecoversWithoutReinitializingSharedBus() {
+  TwoWire bus;
+  setValidRtc(bus);
+  bus.set(kQmi, 0x00, 0x05);
+  bus.set(kQmi, 0x4d, 0x80);
+  setAccel(bus, 0, 0, 8192);
+  bus.failTransaction = 2;  // RTC probe succeeds; the initial primary IMU probe fails.
+  peripherals::Sensors sensors;
+  assert(sensors.begin(bus, 0));
+  assert(!sensors.snapshot().imuReady && !sensors.snapshot().imuConfigReady);
+
+  sensors.update(5000);
+  assert(sensors.snapshot().imuReady && sensors.snapshot().imuConfigReady);
+  assert(!sensors.snapshot().accelerationReady);
+  assert(sensors.snapshot().imuRecoveries == 1);
+  sensors.update(5020);
+  assert(sensors.snapshot().accelerationReady);
 }
 
 void testLearnedOrientationGesturesAndShake() {
@@ -398,15 +464,18 @@ void testImuOutagePreservesLearnedOrientationAndQuietRecovery() {
 int main() {
   testBootReadsWithoutSettingRtc();
   testRtcSampleTimestampTracksCompleteReadsOnly();
+  testSchedulerKeepsCadenceAcrossLateCallsAndMillisRollover();
   testInvalidBcdAndImpossibleCalendar();
   testTwelveHourDecoding();
   testExplicitSetAndStrictValidation();
   testFailedWriteRestartsAndNeverRevalidatesPartialCalendar();
+  testFailedStopWriteRetriesOriginalControlCleanup();
   testFailedSetPreservesOriginallyStoppedClock();
   testShortReadbackCannotValidateSet();
   testRestartReadbackFailureRestoresOriginalStoppedControl();
   testShortRtcControlWriteIsReportedAsFailure();
   testImuSamplingRestoresReadyAfterTransientReadError();
+  testMissingImuAtBootRecoversWithoutReinitializingSharedBus();
   testLearnedOrientationGesturesAndShake();
   testShortKnockPulsesBetweenLegacyPollsAndNoReturnEdgeDoubleCount();
   testQualificationDurationsAndMillisWrap();
