@@ -6,6 +6,27 @@ actions. The current development and release target is the Waveshare
 ESP32-S3-Touch-LCD-3.49 V1. The original 2.8-inch profile remains available as
 a separate legacy build.
 
+<!-- TOC START -->
+## Contents
+
+- [Board profiles](#board-profiles)
+- [Legacy 2.8 profile](#legacy-28-profile)
+- [Verified hardware](#verified-hardware)
+- [Current features](#current-features)
+- [Build](#build)
+- [Flash](#flash)
+- [Install as a Hermes plugin](#install-as-a-hermes-plugin-recommended)
+  - [V1 themes and device settings](#v1-themes-and-device-settings)
+  - [Voice and TTS providers](#voice-and-tts-providers)
+  - [Network transports](#network-transports-tcp-websocket)
+- [Standalone bridge](#standalone-bridge-dev-fallback)
+- [Touch controls](#touch-controls)
+- [Bridge protocol examples](#bridge-protocol-examples)
+- [SD asset pipeline](#sd-asset-pipeline)
+- [Waveshare 3.49 V1 setup](#waveshare-349-v1-setup)
+- [Native extension status](#native-extension-status)
+<!-- TOC END -->
+
 ## Board profiles
 
 | Board | PlatformIO environment | Display | Release guide |
